@@ -1,59 +1,85 @@
 # AGENT HANDOVER - OpenClaw Telegram Bot
 
 **Last Updated**: 2026-02-17  
-**Current Status**: ✅ **WORKING** - Bot responds via NVIDIA API (slow but functional)  
-**Priority**: MEDIUM - Now building CLI Router
+**Current Status**: 🟡 **PARTIALLY WORKING** - NVIDIA API works, local router has format issue  
+**Priority**: HIGH - Fix content format in router
 
 ---
 
 ## 🎉 Current Status
 
-**✅ Telegram Bot WORKING!**
+**✅ Telegram Bot WORKING via NVIDIA API!**
 - Bot: `@assistant_clauze_bot`
 - Provider: NVIDIA API (`moonshotai/kimi-k2.5`)
-- Status: Responding to messages (slow ~10-20s response time)
+- Status: Responding to messages
+- Response time: ~10-20s
 - API Key: `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`
 
-**✅ Completed Fixes:**
-1. Disk space freed (7GB)
-2. Bot token configured
-3. NVIDIA API provider configured
-4. Gateway running with correct model
+**❌ Local Router Issue:**
+- Router runs on port 4097 ✓
+- Router calls OpenCode CLI ✓
+- Router returns response ✓
+- **BUT**: OpenClaw stores **empty content `[]`**
 
 ---
 
-## 🔧 Current Task: Build CLI Router
+## 🎯 CRITICAL DISCOVERY: Content Format
 
-**Goal**: Create a unified OpenAI-compatible API router that wraps multiple CLI tools:
-- OpenCode CLI
-- Kilocode CLI  
-- Claude Code CLI
+**The Issue:**
+NVIDIA API returns content as **ARRAY**:
+```json
+"content": [{"type": "text", "text": "Hello!"}]
+```
+
+Our router returns **STRING**:
+```json
+"content": "Hello!"
+```
+
+**Result:** OpenClaw stores empty content when using the router!
+
+**Solution Needed:**
+Update router to return ARRAY format with `type` and `text` fields.
+
+---
+
+## 🔧 CLI Router Development
 
 **Repository**: https://github.com/IsleOf/wraprouter
 
-### Router Features Needed:
-1. ✅ OpenAI-compatible `/v1/chat/completions` endpoint
-2. ✅ Model multiplexing (route to correct backend)
-3. ⏳ Support for multiple CLI backends
-4. ⏳ Error handling & retries
-5. ⏳ Request/response logging
-6. ⏳ Configuration file support
+**Location on Server**: `/home/ubuntu/cli_router.py`
 
-### Router Architecture:
+### Current Router Code:
+```python
+# Returns content as STRING (WRONG)
+resp = {
+    "choices": [{
+        "message": {
+            "role": "assistant",
+            "content": out  # STRING - needs to be ARRAY
+        }
+    }]
+}
 ```
-OpenClaw → CLI Router (port 4097) → CLI Tool (OpenCode/Kilocode/Claude)
-                ↓
-         Standard OpenAI API format
+
+### Fixed Router Code (NEEDS DEPLOYMENT):
+```python
+# Returns content as ARRAY (CORRECT)
+resp = {
+    "choices": [{
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": out}]  # ARRAY
+        }
+    }]
+}
 ```
 
 ---
 
 ## 📋 Configuration
 
-### OpenClaw Config Location:
-`/home/ubuntu/.openclaw/openclaw.json`
-
-### Current Working Config:
+### Current Working Config (NVIDIA):
 ```json
 {
   "models": {
@@ -62,20 +88,34 @@ OpenClaw → CLI Router (port 4097) → CLI Tool (OpenCode/Kilocode/Claude)
         "baseUrl": "https://integrate.api.nvidia.com/v1",
         "apiKey": "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",
         "api": "openai-completions",
-        "models": [
-          {
-            "id": "moonshotai/kimi-k2.5",
-            "name": "Kimi K2.5 (NVIDIA)"
-          }
-        ]
+        "models": [{"id": "moonshotai/kimi-k2.5", "name": "Kimi K2.5 (NVIDIA)"}]
       }
     }
   },
   "agents": {
     "defaults": {
-      "model": {
-        "primary": "nvidia/moonshotai/kimi-k2.5"
+      "model": {"primary": "nvidia/moonshotai/kimi-k2.5"}
+    }
+  }
+}
+```
+
+### Local Router Config (FOR TESTING):
+```json
+{
+  "models": {
+    "providers": {
+      "opencode-local": {
+        "baseUrl": "http://127.0.0.1:4097/v1",
+        "apiKey": "local",
+        "api": "openai-completions",
+        "models": [{"id": "opencode/kimi-k2.5-free", "name": "Kimi K2.5"}]
       }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {"primary": "opencode-local/opencode/kimi-k2.5-free"}
     }
   }
 }
@@ -83,7 +123,7 @@ OpenClaw → CLI Router (port 4097) → CLI Tool (OpenCode/Kilocode/Claude)
 
 ---
 
-## 🛠️ Development Commands
+## 🛠️ Commands
 
 ### Check Bot Status:
 ```bash
@@ -96,73 +136,75 @@ openclaw gateway status
 tail -f /tmp/openclaw-1000/openclaw-2026-02-17.log | grep -E "telegram|nvidia|agent"
 ```
 
-### Test NVIDIA API:
+### Test Router:
 ```bash
-curl -s https://integrate.api.nvidia.com/v1/models \
-  -H "Authorization: Bearer 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"
+curl -s -X POST "http://127.0.0.1:4097/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "opencode/kimi-k2.5-free", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-### SSH to VPS:
+### Switch Between Providers:
 ```bash
-ssh -i ~/.ssh/tailscale_key ubuntu@100.93.10.110
+# Use NVIDIA (working)
+openclaw config set agents.defaults.model.primary "nvidia/moonshotai/kimi-k2.5"
+
+# Use Local Router (testing)
+openclaw config set agents.defaults.model.primary "opencode-local/opencode/kimi-k2.5-free"
+
+# Restart after switching
+openclaw gateway restart
 ```
 
 ---
 
-## 📝 CLI Router Specification
+## 🐛 Known Issues
 
-The router should:
-
-1. **Listen on port 4097** (or configurable)
-2. **Accept OpenAI-compatible requests**:
-   - POST `/v1/chat/completions`
-   - GET `/v1/models`
-3. **Route to correct backend** based on model ID:
-   - `opencode/*` → OpenCode CLI
-   - `kilocode/*` → Kilocode CLI
-   - `claude/*` → Claude Code CLI
-4. **Convert responses** to OpenAI format:
-   - Content as STRING (not array) for openai-completions API
-5. **Handle errors gracefully**
-
-### Example Request Flow:
-```
-OpenClaw sends:
-POST /v1/chat/completions
-{
-  "model": "opencode/kimi-k2.5-free",
-  "messages": [{"role": "user", "content": "Hello"}]
-}
-
-Router executes:
-opencode run -m opencode/kimi-k2.5-free "Hello"
-
-Router returns:
-{
-  "choices": [{
-    "message": {
-      "role": "assistant",
-      "content": "Hello! How can I help?"
-    }
-  }]
-}
-```
+1. **Router Content Format**: Returns STRING instead of ARRAY
+2. **Slow NVIDIA Responses**: 10-20s (normal for free tier)
+3. **Web Search Tool**: Needs Brave API key (not configured)
 
 ---
 
-## 🆘 Troubleshooting
+## ✅ Completed Tasks
 
-**If bot stops responding:**
-1. Check gateway: `openclaw gateway status`
-2. Check logs: `tail /tmp/openclaw-1000/openclaw-2026-02-17.log`
-3. Check NVIDIA API: Test with curl
-4. Restart gateway: `openclaw gateway restart`
-
-**Slow responses:**
-- NVIDIA API has latency (~10-20s)
-- This is normal for free tier
-- Consider upgrading or using local models
+1. ✅ Fixed disk space (7GB freed)
+2. ✅ Created new Telegram bot (@assistant_clauze_bot)
+3. ✅ Configured NVIDIA API provider
+4. ✅ Built CLI Router framework
+5. ✅ Identified content format issue
+6. ✅ Pushed router to GitHub
 
 ---
 
-**Next Action**: Continue building CLI Router with multi-backend support
+## 📝 Next Actions
+
+1. **Fix router content format** to return ARRAY instead of STRING
+2. **Test router** with OpenClaw
+3. **Add more backends** (Kilocode, Claude Code)
+4. **Create systemd service** for router auto-start
+
+---
+
+## 🔍 Debugging Tips
+
+**Check if content is empty:**
+```bash
+tail -1 ~/.openclaw/agents/main/sessions/58771608-a648-4d92-93c6-74e75af570ce.jsonl | grep "content"
+```
+
+**Compare NVIDIA vs Router responses:**
+```bash
+# NVIDIA returns:
+"content": [{"type": "text", "text": "Hello!"}]
+
+# Router returns:
+"content": "Hello!"
+```
+
+**The fix:** Wrap content in array with type/text structure.
+
+---
+
+**Last Action**: Identified that router must return content as ARRAY `[{"type": "text", "text": "..."}]` not STRING `"..."`
+
+**Next Action**: Update router code to return proper ARRAY format and redeploy

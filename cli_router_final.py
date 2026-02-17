@@ -1,27 +1,7 @@
 #!/usr/bin/env python3
 """
-CLI Router with Format Conversion for OpenClaw
-Converts CLI tool output to OpenAI-compatible API format
-
-Features:
-- Wraps OpenCode CLI commands
-- Converts string responses to OpenClaw-compatible array format
-- Provides OpenAI-compatible /v1/chat/completions endpoint
-
-Usage:
-    python3 cli_router.py
-    
-Test:
-    curl -s -X POST "http://127.0.0.1:4097/v1/chat/completions" \
-      -H "Content-Type: application/json" \
-      -d '{"model": "opencode/kimi-k2.5-free", "messages": [{"role": "user", "content": "Hello"}]}'
-
-Format Conversion:
-    Input (from OpenCode CLI):
-        "Hello! How can I help you today?"
-    
-    Output (to OpenClaw):
-        [{"type": "text", "text": "Hello! How can I help you today?"}]
+CLI Router with Format Conversion
+Converts OpenCode CLI output to OpenAI-compatible format for OpenClaw
 """
 
 import json
@@ -68,11 +48,9 @@ def convert_to_openclaw_format(text_response):
 
 class RouterHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        """Suppress default logging"""
         pass
 
     def do_GET(self):
-        """Handle GET requests"""
         if self.path == "/v1/models":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -90,17 +68,10 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(
-                json.dumps(
-                    {
-                        "status": "CLI Router with Format Conversion",
-                        "endpoints": ["/v1/models", "/v1/chat/completions"],
-                        "format": "Converts CLI output to OpenClaw array format",
-                    }
-                ).encode()
+                json.dumps({"status": "CLI Router with Format Conversion"}).encode()
             )
 
     def do_POST(self):
-        """Handle POST requests"""
         if self.path == "/v1/chat/completions":
             try:
                 content_length = int(self.headers.get("Content-Length", 0))
@@ -109,7 +80,6 @@ class RouterHandler(BaseHTTPRequestHandler):
                 model = body.get("model", "opencode/kimi-k2.5-free")
                 messages = body.get("messages", [])
 
-                # Extract user prompt
                 prompt = ""
                 for msg in reversed(messages):
                     if msg.get("role") == "user":
@@ -120,7 +90,6 @@ class RouterHandler(BaseHTTPRequestHandler):
                     self.send_error(400, "No user message")
                     return
 
-                # Call OpenCode CLI
                 env = os.environ.copy()
                 env["PATH"] = "/home/ubuntu/.opencode/bin:" + env.get("PATH", "")
 
@@ -138,10 +107,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     cleaned = f"Error: {str(e)}"
 
-                # FORMAT CONVERSION: Wrap in array format for OpenClaw
                 formatted_content = convert_to_openclaw_format(cleaned)
 
-                # Build OpenAI-compatible response
                 timestamp = int(time.time())
                 response = {
                     "id": f"chatcmpl-{timestamp}",
@@ -153,7 +120,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                             "index": 0,
                             "message": {
                                 "role": "assistant",
-                                "content": formatted_content,  # ARRAY FORMAT
+                                "content": formatted_content,
                             },
                             "finish_reason": "stop",
                         }
@@ -176,7 +143,5 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
 
-if __name__ == "__main__":
-    print("[ROUTER] Starting CLI Router with Format Conversion on 127.0.0.1:4097")
-    print("[ROUTER] Format: Converts CLI string output to OpenClaw array format")
-    HTTPServer(("127.0.0.1", 4097), RouterHandler).serve_forever()
+print("[ROUTER] Starting CLI Router with Format Conversion on 127.0.0.1:4097")
+HTTPServer(("127.0.0.1", 4097), RouterHandler).serve_forever()

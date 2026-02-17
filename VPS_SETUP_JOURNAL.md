@@ -1,301 +1,277 @@
-# OpenClaw VPS Setup - Complete Journey Documentation
+# VPS Setup Journal - OpenClaw Telegram Bot
 
-## Date: 2026-02-16
-## Author: AI Agent via OpenCode
-
----
-
-## Overview
-
-This document chronicles the complete setup of an autonomous OpenClaw AI agent on an AWS VPS, connecting through Telegram, using Tailscale for remote access, and integrating free LLM models from OpenCode.
+**Date**: 2026-02-17  
+**Project**: OpenClaw Telegram Integration  
+**Bot**: @assistant_clauze_bot
 
 ---
 
-## 1. AWS Server Setup
+## Initial Problem
 
-### Server Details
-- **Public IP**: 3.106.138.96
-- **Instance**: ip-172-31-36-81.ap-southeast-2.compute.internal
-- **SSH Key**: openclaw_serverr.pem
-- **User**: ubuntu
-
-### Initial Connection
-```bash
-ssh -i "C:\Users\PC\Downloads\openclaw_serverr.pem" ubuntu@3.106.138.96
-```
+Telegram bot was not responding to messages. Investigation revealed:
+1. Server disk was 100% full (29GB/29GB)
+2. OpenClaw gateway couldn't function without disk space
+3. Previous bot token may have been deprecated
 
 ---
 
-## 2. Tailscale Setup (For Autonomous Agent Access)
+## Fixes Applied
 
-### Problem
-- SSH keys couldn't be shared with AI agent for security reasons
-- Needed a way for AI agent to access the VPS autonomously
-
-### Solution: Tailscale VPN
-
-#### On AI Agent Side (This Environment):
+### 1. Disk Space Cleanup ✅
 ```bash
-# Add Tailscale repository
-curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg > /dev/null
-curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
-sudo apt-get update
-sudo apt-get install -y tailscale
+# Freed 7GB of space
+rm -rf ~/.cache/*          # 5.5GB
+npm cache clean --force    # npm cache
+sudo journalctl --vacuum-time=3d  # old logs
+find /tmp -name "openclaw*.log" -mtime +2 -delete  # old logs
 
-# Connect and get auth URL
-sudo tailscale up
-# Provided URL: https://login.tailscale.com/a/10ecc57501855f
+# Result: 6.2GB free (79% usage)
 ```
 
-#### On AWS Server Side:
-```bash
-# Already had Tailscale installed
-tailscale ip -4
-# Output: 100.93.10.110
-```
+### 2. New Telegram Bot ✅
+- Created new bot: `@assistant_clauze_bot`
+- Token: `8233548348:AAF-MfrapA4msggPkzuwy75wBaMNrdBsvjQ`
+- Configured in OpenClaw
 
-#### SSH Key Exchange (For Passwordless Access):
-On AWS server:
-```bash
-mkdir -p ~/.ssh
-echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDtkUZLTUsJbVtHgHo3Wi3Wrw7lrgwt0qapuW9aoL/Oz dev@DESKTOP-F3V5NK7" >> ~/.ssh/authorized_keys
-chmod 700 ~/.ssh
-chmod 600 ~/.ssh/authorized_keys
-```
-
-#### Final Connection:
-```bash
-ssh -i ~/.ssh/tailscale_key ubuntu@100.93.10.110
-```
-
----
-
-## 3. OpenClaw Installation
-
-### On AWS Server:
-```bash
-# Install OpenClaw
-curl -fsSL https://openclaw.ai/install.sh | bash
-
-# Initial setup
-openclaw onboard --install-daemon
-
-# Add to PATH
-export PATH="$HOME/.npm-global/bin:$PATH"
-```
-
----
-
-## 4. OpenCode Server Setup (Free LLM Models)
-
-### Installation:
-```bash
-# Install OpenCode
-curl -fsSL https://opencode.ai/install | bash
-
-# Start server on port 4096
-export PATH=$HOME/.opencode/bin:$PATH
-opencode serve --port 4096 --hostname 0.0.0.0
-```
-
-### Available Free Models:
-- `opencode/kimi-k2.5-free`
-- `opencode/minimax-m2.5-free`
-- `google/antigravity-claude-opus-4.5` (requires auth)
-- `google/antigravity-gemini-3-pro` (requires auth)
-
----
-
-## 5. OpenClaw Configuration
-
-### Working Config (YAML format):
+### 3. NVIDIA API Provider ✅
 ```json
 {
-  "meta": {
-    "lastTouchedVersion": "2026.2.13",
-    "lastTouchedAt": "2026-02-16T01:00:00.000Z"
-  },
-  "auth": {
-    "profiles": {
-      "openrouter:default": {
-        "provider": "openrouter",
-        "mode": "api_key"
+  "models": {
+    "providers": {
+      "nvidia": {
+        "baseUrl": "https://integrate.api.nvidia.com/v1",
+        "apiKey": "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",
+        "api": "openai-completions",
+        "models": [{"id": "moonshotai/kimi-k2.5", "name": "Kimi K2.5"}]
+      }
+    }
+  }
+}
+```
+
+**Result**: Bot working, responds in ~10-20s
+
+---
+
+## CLI Router Development
+
+### Goal
+Build a local router to wrap OpenCode CLI and provide faster responses than NVIDIA API.
+
+### Router Features Built
+1. ✅ HTTP server on port 4097
+2. ✅ OpenAI-compatible `/v1/chat/completions` endpoint
+3. ✅ Calls OpenCode CLI: `opencode run -m <model> <prompt>`
+4. ✅ Cleans ANSI codes from output
+5. ✅ Returns content as ARRAY format: `[{"type": "text", "text": "..."}]`
+
+### Router Code
+```python
+# Key function: convert_to_openclaw_format
+def convert_to_openclaw_format(text_response):
+    """Convert plain text to OpenClaw expected format"""
+    return [{"type": "text", "text": text_response}]
+```
+
+### Testing Router
+```bash
+# Manual test - WORKS
+curl -s -X POST "http://127.0.0.1:4097/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "opencode/kimi-k2.5-free", "messages": [{"role": "user", "content": "Hello"}]}'
+
+# Returns:
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": [{"type": "text", "text": "Hello! How can I help you today?"}]
+    }
+  }]
+}
+```
+
+---
+
+## The Mystery: OpenClaw Not Calling Router
+
+### Configuration
+```json
+{
+  "models": {
+    "providers": {
+      "opencode-local": {
+        "baseUrl": "http://127.0.0.1:4097/v1",
+        "apiKey": "opencode-free",
+        "api": "openai-completions",
+        "models": [{"id": "opencode/kimi-k2.5-free", "name": "Kimi"}]
       }
     }
   },
   "agents": {
     "defaults": {
-      "model": {
-        "primary": "openrouter/quickie-ai/minimax-m2.5-free"
-      },
-      "models": {
-        "openrouter/quickie-ai/minimax-m2.5-free": {
-          "alias": "MiniMax M2.5 Free"
-        },
-        "openrouter/auto": {
-          "alias": "OpenRouter Auto"
-        }
-      },
-      "workspace": "/home/ubuntu/.openclaw/workspace"
-    }
-  },
-  "tools": {
-    "exec": {
-      "host": "gateway",
-      "security": "full",
-      "ask": "off"
-    }
-  },
-  "channels": {
-    "telegram": {
-      "enabled": true,
-      "dmPolicy": "open",
-      "allowFrom": ["*"],
-      "botToken": "8573345722:AAFU5BUISq4j7HOAI2x7NvblVDRtVC30Vyc"
-    }
-  },
-  "gateway": {
-    "port": 18789,
-    "mode": "local",
-    "auth": {
-      "mode": "token",
-      "token": "4272baca0ae5b42729b6db36a633745511a0cdfa9e9db8b6"
-    }
-  },
-  "plugins": {
-    "entries": {
-      "telegram": {
-        "enabled": true
-      }
+      "model": {"primary": "opencode-local/opencode/kimi-k2.5-free"}
     }
   }
 }
 ```
 
-### Setting Model via CLI:
-```bash
-openclaw config set agents.defaults.model.primary openrouter/quickie-ai/minimax-m2.5-free
-openclaw gateway restart
-```
+### Expected Behavior
+1. OpenClaw receives Telegram message
+2. OpenClaw calls `http://127.0.0.1:4097/v1/chat/completions`
+3. Router executes OpenCode CLI
+4. Router returns response
+5. OpenClaw sends reply to Telegram
+
+### Actual Behavior
+1. ✅ OpenClaw receives Telegram message
+2. ❌ OpenClaw does NOT call router (router debug log is empty)
+3. OpenClaw shows `provider=opencode-local` in logs
+4. OpenClaw stores empty content `[]` in session
+5. No response sent to Telegram
+
+### Debugging Attempted
+
+1. **Added debug logging to router**
+   - Logs every HTTP request
+   - Log file: `/tmp/router_debug.log`
+   - Result: Log stays empty when OpenClaw processes messages
+
+2. **Verified router is reachable**
+   ```bash
+   curl http://127.0.0.1:4097/v1/models  # Works
+   ```
+
+3. **Checked OpenClaw logs**
+   - Shows `provider=opencode-local`
+   - Shows `model=opencode/kimi-k2.5-free`
+   - No connection errors
+   - Run completes with `isError=false`
+   - Duration: ~4 seconds
+
+4. **Compared NVIDIA vs Local**
+   - NVIDIA: Content stored correctly
+   - Local: Content is empty `[]`
+
+5. **Tested response format**
+   - Tried STRING format: `"content": "Hello!"`
+   - Tried ARRAY format: `"content": [{"type": "text", "text": "Hello!"}]`
+   - Both result in empty content in OpenClaw
+
+### Hypotheses
+
+1. **OpenClaw has internal fallback**
+   - When local provider fails, silently uses something else
+   - No error logs to indicate failure
+
+2. **OpenClaw doesn't actually call the provider**
+   - Configuration is read but not used
+   - Possible bug in OpenClaw provider selection
+
+3. **Network isolation**
+   - OpenClaw running in different network context
+   - Can't reach 127.0.0.1:4097
+
+4. **API endpoint mismatch**
+   - `openai-completions` might require different endpoint
+   - Should test with raw OpenAI format
 
 ---
 
-## 6. Exec Permissions (Full Autonomous Mode)
+## Repository
 
-### Exec Approvals Config (`~/.openclaw/exec-approvals.json`):
-```json
-{
-  "version": 1,
-  "defaults": {
-    "security": "full",
-    "ask": "off",
-    "askFallback": "allow",
-    "autoAllowSkills": true
-  },
-  "agents": {
-    "main": {
-      "security": "full",
-      "ask": "off",
-      "allowlist": []
-    }
-  }
-}
-```
+**GitHub**: https://github.com/IsleOf/wraprouter
 
-### Session-Level Override (via Telegram):
-```
-/exec host=gateway security=full ask=off
-```
+**Files:**
+- `cli_router.py` - Main router with format conversion
+- `CLI_ROUTER.md` - Documentation
+- `HANDOVER.md` - Agent handover document
 
 ---
 
-## 7. Troubleshooting Commands
+## Commands Reference
 
-### Check Status:
-```bash
-openclaw gateway status
-```
-
-### View Logs:
-```bash
-openclaw logs --follow
-tail -f /tmp/openclaw/openclaw-2026-02-15.log
-```
-
-### Fix Config:
-```bash
-openclaw doctor --fix
-openclaw gateway restart
-```
-
-### Test Model:
-```bash
-openclaw models list
-```
-
----
-
-## 8. Key Learnings
-
-### Issues Encountered:
-1. **SSH Key Security**: Cannot share private SSH keys with AI agent
-   - Solution: Use Tailscale VPN + pre-shared SSH key
-
-2. **OpenClaw Config Schema**: Many config keys are unrecognized
-   - Solution: Use `openclaw doctor --fix` to auto-remove invalid keys
-   - Use CLI commands like `openclaw config set` instead of manual JSON
-
-3. **Model Provider**: OpenCode models need proper auth profile
-   - Solution: Use OpenRouter for free models instead
-
-4. **Telegram Web**: Clock icon issue - messages stuck in pending
-   - Solution: Use incognito mode or different browser
-
-5. **Exec Permissions**: Agent wouldn't run commands
-   - Solution: Set `/exec host=gateway security=full ask=off` via Telegram
-
-### Available Free Models:
-- **OpenRouter**: `openrouter/quickie-ai/minimax-m2.5-free`
-- **OpenCode**: `opencode/kimi-k2.5-free`, `opencode/minimax-m2.5-free`
-
----
-
-## 9. File Locations
-
-| File | Path |
-|------|------|
-| OpenClaw Config | `~/.openclaw/openclaw.json` |
-| Exec Approvals | `~/.openclaw/exec-approvals.json` |
-| OpenClaw Logs | `/tmp/openclaw/openclaw-2026-02-15.log` |
-| Workspace | `~/.openclaw/workspace/` |
-| OpenCode Config | `~/.config/opencode/opencode.json` |
-
----
-
-## 10. Quick Reference
-
-### Connect to Server:
+### SSH to VPS
 ```bash
 ssh -i ~/.ssh/tailscale_key ubuntu@100.93.10.110
 ```
 
-### Restart OpenClaw:
+### Check OpenClaw Status
 ```bash
 export PATH=$HOME/.npm-global/bin:$PATH
+openclaw gateway status
+```
+
+### Switch Providers
+```bash
+# NVIDIA (working)
+openclaw config set agents.defaults.model.primary "nvidia/moonshotai/kimi-k2.5"
+
+# Local router (debugging)
+openclaw config set agents.defaults.model.primary "opencode-local/opencode/kimi-k2.5-free"
+
+# Restart
 openclaw gateway restart
 ```
 
-### Check Models:
+### Test Router
 ```bash
-export PATH=$HOME/.npm-global/bin:$PATH
-openclaw models list
+# Test models endpoint
+curl http://127.0.0.1:4097/v1/models
+
+# Test chat
+curl -s -X POST "http://127.0.0.1:4097/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "opencode/kimi-k2.5-free", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+### View Logs
+```bash
+# OpenClaw logs
+tail -f /tmp/openclaw-1000/openclaw-2026-02-17.log
+
+# Router debug log
+cat /tmp/router_debug.log
+
+# Session
+tail -f ~/.openclaw/agents/main/sessions/58771608-a648-4d92-93c6-74e75af570ce.jsonl
 ```
 
 ---
 
-## 11. Future Enhancements Needed
+## File Locations
 
-1. **Voice/Whisper**: Install local Whisper for audio transcription
-2. **Browser Automation**: Configure Playwright instead of Brave API
-3. **Proactive Mode**: Set up heartbeat and cron jobs for autonomous operation
-4. **More Free Models**: Configure Antigravity OAuth for Claude/Gemini access
+- **OpenClaw Config**: `~/.openclaw/openclaw.json`
+- **OpenClaw Logs**: `/tmp/openclaw-1000/openclaw-2026-02-17.log`
+- **Router**: `/home/ubuntu/cli_router.py`
+- **Router Debug Log**: `/tmp/router_debug.log`
+- **Session**: `~/.openclaw/agents/main/sessions/58771608-a648-4d92-93c6-74e75af570ce.jsonl`
+
+---
+
+## Next Steps
+
+1. **Investigate OpenClaw provider calling**
+   - Check if OpenClaw actually attempts HTTP connection
+   - Use tcpdump or strace to see network activity
+   - Check for connection refused/timeout errors
+
+2. **Alternative: Use opencode serve**
+   - `opencode serve --port 4097` provides built-in API
+   - Test if OpenClaw can connect to that
+
+3. **Alternative: Use LiteLLM proxy**
+   - LiteLLM can wrap CLI tools
+   - Provides standard OpenAI API
+
+4. **Debug OpenClaw source**
+   - Check how `openai-completions` provider works
+   - Look for HTTP client code
+   - Find where requests are made
+
+---
+
+**Summary**: Router is built and working correctly when tested manually. OpenClaw shows correct provider in logs but never actually calls the router. This is a blocking issue that needs investigation at the OpenClaw level.
+
+**Working Setup**: NVIDIA API (for now)  
+**Goal**: Get local router working for faster responses

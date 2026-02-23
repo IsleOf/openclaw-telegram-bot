@@ -1,277 +1,147 @@
-# VPS Setup Journal - OpenClaw Telegram Bot
+# VPS Setup Journal
 
-**Date**: 2026-02-17  
-**Project**: OpenClaw Telegram Integration  
-**Bot**: @assistant_clauze_bot
+Chronological log of what was built and what broke. For current state, see [HANDOVER.md](HANDOVER.md).
 
 ---
 
-## Initial Problem
+## 2026-02-15: Initial Setup
 
-Telegram bot was not responding to messages. Investigation revealed:
-1. Server disk was 100% full (29GB/29GB)
-2. OpenClaw gateway couldn't function without disk space
-3. Previous bot token may have been deprecated
+- Launched AWS EC2 t3.micro in ap-southeast-2 (Sydney)
+- Installed Node.js 20, OpenClaw, Tailscale
+- Created Telegram bot `@assistant_clauze_bot` via BotFather
+- Configured NVIDIA API (Kimi K2.5) as model provider — worked but slow (~10–20s)
+- Basic bot responding in Telegram
 
 ---
 
-## Fixes Applied
+## 2026-02-17: Router v1 + Disk Crisis
 
-### 1. Disk Space Cleanup ✅
-```bash
-# Freed 7GB of space
-rm -rf ~/.cache/*          # 5.5GB
-npm cache clean --force    # npm cache
-sudo journalctl --vacuum-time=3d  # old logs
-find /tmp -name "openclaw*.log" -mtime +2 -delete  # old logs
+- Built CLI Router v1 to wrap OpenCode CLI for faster free-tier model access
+- **Crisis**: VPS disk hit 100% — 4,028 leaked `.fbd*.so` files in `/tmp` consuming 16.5GB
+  - OpenClaw silently returned empty `content: []` responses
+  - Deleted files: `find /tmp -name '*.fbd*.so' -delete`
+  - Added hourly cron to clean these: `0 * * * * find /tmp -name '*.fbd*.so' -mmin +60 -delete`
+- **Bug found**: Router v1 only returned plain JSON — OpenClaw requires SSE streaming (`stream: true` always, OpenAI JS SDK behaviour)
+- Fixed: added `text/event-stream` SSE response format (Router v2)
 
-# Result: 6.2GB free (79% usage)
+---
+
+## 2026-02-18: Web Browser Skill + Context Problem
+
+- Deployed Playwright-based web browser skill
+  - `web_search.py` — DuckDuckGo via `ddgs` Python library (search engines block headless browsers directly)
+  - `web_fetch.py` — Stealth Playwright page reader
+  - `web_browse.py` — Persistent browser profiles for authenticated sites
+- Added stealth anti-detection JS injection for page fetching
+- **MAIN BUG FOUND**: Router was stripping all context from OpenClaw requests
+  - OpenClaw sends ~48KB (system prompt with identity, AGENTS.md, 22 tool JSON schemas, conversation history)
+  - Router was only forwarding the last user message text
+  - Bot had no memory, no identity, couldn't use skills
+- Built Router v3: `build_mega_prompt()` packs everything into one prompt for opencode CLI
+
+---
+
+## 2026-02-18: kimi-k2.5-free Removed
+
+- OpenCode dropped `kimi-k2.5-free` from the free tier without notice
+- Switched primary model to `opencode/glm-5-free`
+- Added router auto-remap: any model name containing "kimi" → glm-5-free
+- Available free models: `glm-5-free`, `minimax-m2.5-free`, `trinity-large-preview-free`
+
+---
+
+## 2026-02-19: Tailscale Exit Node Disaster
+
+- Attempted to set Tailscale exit node on VPS for better web browsing IPs
+  - `tailscale set --exit-node=100.70.48.72` (Android TV stick)
+- Android TV stick went offline → all VPS routing immediately broken
+- SSH unreachable, public IP unreachable — setting persists across reboots
+- **Recovery**: AWS EC2 console → Instance → Edit User Data →
+  ```bash
+  #!/bin/bash
+  tailscale set --exit-node=
+  ```
+  Stop instance → Start instance (not reboot — user data runs on start)
+- VPS routing restored; re-added ed25519 SSH key via EC2 Instance Connect
+
+**Lesson**: Never set exit-node on a remote server unless you have out-of-band rescue access.
+
+---
+
+## 2026-02-20: Full Deployment
+
+- VPS back online after Tailscale fix
+- Re-added SSH authorized key (ed25519 from dev machine)
+- Deployed Router v3 to VPS
+- Updated OpenClaw config: model `opencode/glm-5-free`, exec security=full, ask=off
+- Restarted router and gateway — both confirmed running
+- Gateway log: `agent model: opencode-local/opencode/glm-5-free`
+- Bot responding in Telegram with full context and memory
+
+---
+
+## 2026-02-22: Personal Agent Features
+
+Researched OpenClaw community patterns. Deployed:
+
+- **Heartbeat** (every 60 min, 07:00–23:00): System monitoring checklist in `HEARTBEAT.md`
+  - Checks disk usage, router/gateway ports, RAM
+  - Reviews TODOS.md for reminders
+- **MEMORY.md**: Long-term memory file — user info, key projects, preferences
+- **TODOS.md**: Task list the agent can read and update
+- **3 cron jobs**: Morning Briefing (daily 08:00), System Check (every 6h), Estonian News (every 12h)
+- Router v4: Aggressive prompt compression (48K → 8K chars), switched to `minimax-m2.5-free` for speed
+- Increased router timeout from 90s to 300s (user: "change timeouts so bot waits for answer not spits out apologies")
+
+Test results: simple queries 5s, todo management 10s, system status 25s, memory recall 44s.
+
+---
+
+## 2026-02-23: Router v5 + Critical Bug Fix
+
+**Problem**: Bot stopped answering — just listed its capabilities repeatedly for every query.
+
+**Root cause investigation** (log analysis):
 ```
-
-### 2. New Telegram Bot ✅
-- Created new bot: `@assistant_clauze_bot`
-- Token: `8233548348:AAF-MfrapA4msggPkzuwy75wBaMNrdBsvjQ`
-- Configured in OpenClaw
-
-### 3. NVIDIA API Provider ✅
-```json
-{
-  "models": {
-    "providers": {
-      "nvidia": {
-        "baseUrl": "https://integrate.api.nvidia.com/v1",
-        "apiKey": "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",
-        "api": "openai-completions",
-        "models": [{"id": "moonshotai/kimi-k2.5", "name": "Kimi K2.5"}]
-      }
-    }
-  }
-}
+prompt=12000  # hitting the 12K char max limit
 ```
-
-**Result**: Bot working, responds in ~10-20s
-
----
-
-## CLI Router Development
-
-### Goal
-Build a local router to wrap OpenCode CLI and provide faster responses than NVIDIA API.
-
-### Router Features Built
-1. ✅ HTTP server on port 4097
-2. ✅ OpenAI-compatible `/v1/chat/completions` endpoint
-3. ✅ Calls OpenCode CLI: `opencode run -m <model> <prompt>`
-4. ✅ Cleans ANSI codes from output
-5. ✅ Returns content as ARRAY format: `[{"type": "text", "text": "..."}]`
-
-### Router Code
+With 246+ messages in the conversation, the Router v4 history loop never correctly accumulated total length:
 ```python
-# Key function: convert_to_openclaw_format
-def convert_to_openclaw_format(text_response):
-    """Convert plain text to OpenClaw expected format"""
-    return [{"type": "text", "text": text_response}]
+# BROKEN — history_text never updated, so all 246 messages were added:
+history_text = ''
+for h in reversed(recent):
+    candidate = h + '\n' + history_text   # always comparing single entry vs 4000 limit
+    if len(candidate) > MAX_HISTORY_CHARS:
+        break  # never triggered on individual entries
+    kept.insert(0, h)
 ```
+All 246 history entries → filled 12K char limit → final truncation cut off user message → model saw system + history but **no question** → defaulted to describing itself.
 
-### Testing Router
-```bash
-# Manual test - WORKS
-curl -s -X POST "http://127.0.0.1:4097/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "opencode/kimi-k2.5-free", "messages": [{"role": "user", "content": "Hello"}]}'
+**Second problem found**: Router returns plain text (`delta.content`) not tool calls (`tool_calls` JSON). Free-tier LLMs say "I can search the web" but can't actually call tools through the `opencode run` single-shot interface.
 
-# Returns:
-{
-  "choices": [{
-    "message": {
-      "role": "assistant",
-      "content": [{"type": "text", "text": "Hello! How can I help you today?"}]
-    }
-  }]
-}
-```
+**Router v5 fixes**:
+1. History loop correctly tracks `total_len` — history capped at 2,500 chars
+2. User message always protected from truncation (truncate from beginning, not end)
+3. **Tool pre-execution layer**: router detects intent (estonian_news, web_search, web_fetch), runs `web_search.py` / `web_fetch.py` on VPS _before_ calling LLM, injects real results into prompt
+4. LLM now just synthesizes pre-fetched data — no tool calling required
+
+**Test results** (2026-02-23):
+- "Tell me Estonian news for today" → real headlines (Henry Sildaru Olympic silver, etc.) in 37s
+- "7 * 8" → "56" in 4s
+- "search for latest AI models 2026" → real search results in 36s
+
+Both services converted to systemd user services for auto-restart on failure.
 
 ---
 
-## The Mystery: OpenClaw Not Calling Router
+## Lessons Learned
 
-### Configuration
-```json
-{
-  "models": {
-    "providers": {
-      "opencode-local": {
-        "baseUrl": "http://127.0.0.1:4097/v1",
-        "apiKey": "opencode-free",
-        "api": "openai-completions",
-        "models": [{"id": "opencode/kimi-k2.5-free", "name": "Kimi"}]
-      }
-    }
-  },
-  "agents": {
-    "defaults": {
-      "model": {"primary": "opencode-local/opencode/kimi-k2.5-free"}
-    }
-  }
-}
-```
-
-### Expected Behavior
-1. OpenClaw receives Telegram message
-2. OpenClaw calls `http://127.0.0.1:4097/v1/chat/completions`
-3. Router executes OpenCode CLI
-4. Router returns response
-5. OpenClaw sends reply to Telegram
-
-### Actual Behavior
-1. ✅ OpenClaw receives Telegram message
-2. ❌ OpenClaw does NOT call router (router debug log is empty)
-3. OpenClaw shows `provider=opencode-local` in logs
-4. OpenClaw stores empty content `[]` in session
-5. No response sent to Telegram
-
-### Debugging Attempted
-
-1. **Added debug logging to router**
-   - Logs every HTTP request
-   - Log file: `/tmp/router_debug.log`
-   - Result: Log stays empty when OpenClaw processes messages
-
-2. **Verified router is reachable**
-   ```bash
-   curl http://127.0.0.1:4097/v1/models  # Works
-   ```
-
-3. **Checked OpenClaw logs**
-   - Shows `provider=opencode-local`
-   - Shows `model=opencode/kimi-k2.5-free`
-   - No connection errors
-   - Run completes with `isError=false`
-   - Duration: ~4 seconds
-
-4. **Compared NVIDIA vs Local**
-   - NVIDIA: Content stored correctly
-   - Local: Content is empty `[]`
-
-5. **Tested response format**
-   - Tried STRING format: `"content": "Hello!"`
-   - Tried ARRAY format: `"content": [{"type": "text", "text": "Hello!"}]`
-   - Both result in empty content in OpenClaw
-
-### Hypotheses
-
-1. **OpenClaw has internal fallback**
-   - When local provider fails, silently uses something else
-   - No error logs to indicate failure
-
-2. **OpenClaw doesn't actually call the provider**
-   - Configuration is read but not used
-   - Possible bug in OpenClaw provider selection
-
-3. **Network isolation**
-   - OpenClaw running in different network context
-   - Can't reach 127.0.0.1:4097
-
-4. **API endpoint mismatch**
-   - `openai-completions` might require different endpoint
-   - Should test with raw OpenAI format
-
----
-
-## Repository
-
-**GitHub**: https://github.com/IsleOf/wraprouter
-
-**Files:**
-- `cli_router.py` - Main router with format conversion
-- `CLI_ROUTER.md` - Documentation
-- `HANDOVER.md` - Agent handover document
-
----
-
-## Commands Reference
-
-### SSH to VPS
-```bash
-ssh -i ~/.ssh/tailscale_key ubuntu@100.93.10.110
-```
-
-### Check OpenClaw Status
-```bash
-export PATH=$HOME/.npm-global/bin:$PATH
-openclaw gateway status
-```
-
-### Switch Providers
-```bash
-# NVIDIA (working)
-openclaw config set agents.defaults.model.primary "nvidia/moonshotai/kimi-k2.5"
-
-# Local router (debugging)
-openclaw config set agents.defaults.model.primary "opencode-local/opencode/kimi-k2.5-free"
-
-# Restart
-openclaw gateway restart
-```
-
-### Test Router
-```bash
-# Test models endpoint
-curl http://127.0.0.1:4097/v1/models
-
-# Test chat
-curl -s -X POST "http://127.0.0.1:4097/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "opencode/kimi-k2.5-free", "messages": [{"role": "user", "content": "Hello"}]}'
-```
-
-### View Logs
-```bash
-# OpenClaw logs
-tail -f /tmp/openclaw-1000/openclaw-2026-02-17.log
-
-# Router debug log
-cat /tmp/router_debug.log
-
-# Session
-tail -f ~/.openclaw/agents/main/sessions/58771608-a648-4d92-93c6-74e75af570ce.jsonl
-```
-
----
-
-## File Locations
-
-- **OpenClaw Config**: `~/.openclaw/openclaw.json`
-- **OpenClaw Logs**: `/tmp/openclaw-1000/openclaw-2026-02-17.log`
-- **Router**: `/home/ubuntu/cli_router.py`
-- **Router Debug Log**: `/tmp/router_debug.log`
-- **Session**: `~/.openclaw/agents/main/sessions/58771608-a648-4d92-93c6-74e75af570ce.jsonl`
-
----
-
-## Next Steps
-
-1. **Investigate OpenClaw provider calling**
-   - Check if OpenClaw actually attempts HTTP connection
-   - Use tcpdump or strace to see network activity
-   - Check for connection refused/timeout errors
-
-2. **Alternative: Use opencode serve**
-   - `opencode serve --port 4097` provides built-in API
-   - Test if OpenClaw can connect to that
-
-3. **Alternative: Use LiteLLM proxy**
-   - LiteLLM can wrap CLI tools
-   - Provides standard OpenAI API
-
-4. **Debug OpenClaw source**
-   - Check how `openai-completions` provider works
-   - Look for HTTP client code
-   - Find where requests are made
-
----
-
-**Summary**: Router is built and working correctly when tested manually. OpenClaw shows correct provider in logs but never actually calls the router. This is a blocking issue that needs investigation at the OpenClaw level.
-
-**Working Setup**: NVIDIA API (for now)  
-**Goal**: Get local router working for faster responses
+1. **Never set Tailscale exit-node on a remote server** — if exit node goes offline, VPS becomes completely unreachable with no self-recovery
+2. **OpenClaw always streams** — `stream: true` is hardcoded in OpenAI JS SDK; any provider must return `text/event-stream`
+3. **OpenCode CLI is stateless** — each `opencode run` is fresh; all context must be packed into every call
+4. **Free LLMs describe tools, they don't call them** — pre-execute tools in the router instead of relying on model function-calling
+5. **Context budget matters** — with 246-message history, naive packing fills 12K chars before user message is added
+6. **Test with `stream: false` first** — easier to debug than streaming JSON chunks
+7. **Search engines block headless browsers** — use `ddgs` Python library for search, not browser-based scraping
+8. **Always check what's actually on port 4097** — an old `opencode_wrapper.py` was squatting the port, blocking the new router for days
+9. **Log everything** — `/tmp/router_debug.log` was essential for diagnosing both the truncation bug and the old wrapper issue

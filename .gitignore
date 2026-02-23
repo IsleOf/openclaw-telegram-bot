@@ -1,0 +1,37 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Ruff / linter caches
+.ruff_cache/
+.mypy_cache/
+
+# Old/draft router versions (keep only cli_router.py as source of truth)
+cli_router_v1.py
+cli_router_v2.py
+cli_router_v3.py
+cli_router_final.py
+cli_router_server.py
+router_server.py
+
+# Old setup scripts (superseded by SETUP.md)
+setup.sh
+setup_openclaw.sh
+setup_openclaw_multi_llm.sh
+start_agent_server.sh
+
+# OpenCode local state
+.opencode
+
+# Secrets / keys (never commit)
+*.pem
+*.key
+.env
+secrets/
+
+# OS
+.DS_Store
+Thumbs.db

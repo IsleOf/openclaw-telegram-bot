@@ -1,154 +1,181 @@
-# OpenClaw AWS Server - Project Documentation
+# OpenClaw Telegram Bot — Operations Handbook
 
-## Server Information
+Quick reference for day-to-day operations.
 
-- **Server IP**: 3.106.138.96 (Public)
-- **Instance**: ip-172-31-36-81.ap-southeast-2.compute.internal
-- **SSH Key**: `C:\Users\PC\Downloads\openclaw_serverr.pem`
-- **SSH User**: ubuntu
+---
 
-## Access Methods
+## Server
 
-### Method 1: Command Server (Autonomous Agent Access)
+| Item | Value |
+|------|-------|
+| VPS | AWS EC2 ap-southeast-2 |
+| Tailscale IP | 100.93.10.110 |
+| Public IP | 3.106.138.96 |
+| SSH | `ssh ubuntu@100.93.10.110` |
+| Telegram bot | `@assistant_clauze_bot` |
+
+---
+
+## Services
+
+| Service | Port | Systemd unit |
+|---------|------|-------------|
+| CLI Router v5 | 4097 | `openclaw-router.service` |
+| OpenClaw Gateway | 18789 | `openclaw-gateway.service` |
+
+Both are user-level systemd services (no `sudo` needed).
+
+---
+
+## Common Commands
+
+### SSH into VPS
 ```bash
-# Start the command server on the AWS server:
-cd ~/cmd-server && node server.js &
-
-# Then expose via bore:
-bore local 7777 --to bore.pub
-
-# Agent uses: http://bore.pub:PORT/exec
+ssh ubuntu@100.93.10.110
 ```
 
-### Method 2: Direct SSH
+### Check both services are up
 ```bash
-ssh -i "C:\Users\PC\Downloads\openclaw_serverr.pem" ubuntu@3.106.138.96
+systemctl --user status openclaw-router openclaw-gateway --no-pager
+ss -tlnp | grep -E '4097|18789'
 ```
 
-## Installed Components
-
-- OpenClaw 2026.2.13
-- Node.js 20.x
-- Telegram Bot (enabled)
-- Command Server (port 7777)
-
-## Configuration
-
-Config file: `~/.openclaw/openclaw.json`
-
-### Available Models (OpenRouter)
-- OpenRouter Auto
-- Claude 3.5 Sonnet
-- Claude 3 Opus
-- Gemini Pro
-- Gemini Flash
-- Llama 3.1 405B
-- Kimi K2.5
-- Qwen 2.5 72B
-- DeepSeek Chat
-
-## Quick Commands
-
+### Restart everything
 ```bash
-# Check status
-openclaw gateway status
-
-# Restart
-openclaw gateway restart
-
-# List models
-openclaw models list
-
-# View logs
-tail -f /tmp/openclaw/openclaw-2026-02-15.log
+systemctl --user restart openclaw-router openclaw-gateway
 ```
 
-## Agent Setup Script
-
-To give an AI agent autonomous access:
-
-1. Run on server:
+### View router log (live)
 ```bash
-# Install node if needed
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt-get install -y nodejs
-
-# Create command server
-mkdir -p ~/cmd-server
-cd ~/cmd-server
-npm init -y
-npm install express ws
-
-# Create server.js (see below)
-cat > ~/cmd-server/server.js << 'EOF'
-const express = require('express');
-const { spawn } = require('child_process');
-const app = express();
-app.use(express.json());
-app.post('/exec', (req, res) => {
-  const cmd = req.body.command;
-  if (!cmd) return res.json({error: 'No command'});
-  const shell = spawn(cmd, [], {shell: true, cwd: process.env.HOME || '/home/ubuntu'});
-  let output = '';
-  shell.stdout.on('data', d => output += d);
-  shell.stderr.on('data', d => output += d);
-  shell.on('close', code => res.json({output, code}));
-  setTimeout(() => {shell.kill(); res.json({output, code: -1, timeout: true})}, 30000);
-});
-app.listen(7777, '0.0.0.0', () => console.log('CMD_SERVER_READY'));
-EOF
-
-# Start server
-node ~/cmd-server/server.js &
-
-# Expose via bore (gets public URL)
-bore local 7777 --to bore.pub
+tail -f /tmp/router_debug.log
 ```
 
-2. Agent connects via:
+### View gateway log
 ```bash
-curl -X POST http://bore.pub:PORT/exec -H "Content-Type: application/json" -d '{"command": "YOUR_COMMAND"}'
+tail -30 /tmp/openclaw/openclaw-*.log
 ```
 
-## Future Agent Commands
-
-The agent can use these commands to manage the server:
-
+### Test router directly
 ```bash
-# Fix config issues
-openclaw doctor --fix
-
-# Check gateway
-openclaw gateway status
-
-# View logs
-openclaw logs
-
-# Add new models via OpenRouter
-# Edit ~/.openclaw/openclaw.json and add model entries
-
-# Restart after config changes
-openclaw gateway restart
+curl -s -X POST http://localhost:4097/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"opencode/minimax-m2.5-free","stream":false,
+       "messages":[{"role":"user","content":"hello"}]}'
 ```
 
-## Security Notes
+### Deploy updated router from local
+```bash
+# Run from local machine
+scp "/home/dev/openclaw controller/cli_router.py" ubuntu@100.93.10.110:/home/ubuntu/cli_router.py
+ssh ubuntu@100.93.10.110 "systemctl --user restart openclaw-router"
+```
 
-- Keep the bore tunnel URL private
-- The command server has full shell access - use carefully
-- Telegram bot token is stored in config
-- Gateway token: `4272baca0ae5b42729b6db36a633745511a0cdfa9e9db8b6`
+### Check disk usage
+```bash
+df -h /
+# Alert if >80% — check /tmp for .fbd*.so files
+du -sh /tmp/*.so 2>/dev/null | sort -rh | head -10
+```
+
+### Clean leaked tmp files (if disk fills up)
+```bash
+find /tmp -name '*.fbd*.so' -mmin +60 -delete
+```
+
+---
+
+## Model Management
+
+### Current model
+`opencode/minimax-m2.5-free` (set in systemd service `Environment=ROUTER_MODEL=...`)
+
+### Available free models
+```bash
+~/.opencode/bin/opencode models | grep free
+```
+
+### Switch model temporarily (until restart)
+```bash
+ROUTER_MODEL=opencode/glm-5-free python3 /home/ubuntu/cli_router.py
+```
+
+### Switch model permanently
+Edit `~/.config/systemd/user/openclaw-router.service`:
+```ini
+Environment=ROUTER_MODEL=opencode/glm-5-free
+```
+Then:
+```bash
+systemctl --user daemon-reload && systemctl --user restart openclaw-router
+```
+
+---
+
+## OpenClaw Config
+
+**Location**: `~/.openclaw/openclaw.json`
+
+After editing, validate with:
+```bash
+npx openclaw doctor --fix
+```
+Then restart gateway:
+```bash
+systemctl --user restart openclaw-gateway
+```
+
+---
+
+## Workspace Files
+
+All in `~/.openclaw/workspace/`:
+
+| File | Purpose | Edit when |
+|------|---------|-----------|
+| `IDENTITY.md` | Agent name/persona | Changing agent identity |
+| `USER.md` | User context | User details change |
+| `SOUL.md` | Personality traits | Adjusting bot tone |
+| `AGENTS.md` | Operational instructions | Adding new capabilities |
+| `memory/MEMORY.md` | Long-term memory | Never manually (agent maintains) |
+| `TODOS.md` | Task list | Adding tasks for the agent |
+| `HEARTBEAT.md` | Periodic self-check rules | Changing monitoring thresholds |
+
+---
 
 ## Troubleshooting
 
+| Symptom | Likely cause | Fix |
+|---------|------------|-----|
+| No response in Telegram | Services down | `systemctl --user status openclaw-router openclaw-gateway` |
+| Bot says "Taking longer than 300s" | LLM very slow or hanging | Try again; or restart router |
+| Bot lists capabilities instead of answering | Router issue — check logs | `tail -20 /tmp/router_debug.log` |
+| News requests get no web data | web_search.py broken | `python3 ~/.openclaw/workspace/skills/web-browser/scripts/web_search.py --query "test"` |
+| Disk full (bot goes silent) | `.fbd*.so` file leak | `find /tmp -name '*.fbd*.so' -delete` |
+| Can't SSH | Tailscale down or exit node issue | Use EC2 Instance Connect in AWS console |
+
+---
+
+## ⚠️ Critical Warning — Tailscale
+
+**Never run `tailscale set --exit-node=...` on the VPS.** If the exit node goes offline, all routing breaks including SSH, and it persists through reboots.
+
+**Recovery**: AWS EC2 console → Instance → Actions → Edit User Data → add:
 ```bash
-# Server not responding?
-ps aux | grep node
-kill -9 PID && cd ~/cmd-server && node server.js &
-
-# Bore tunnel down?
-bore local 7777 --to bore.pub
-
-# OpenClaw issues?
-openclaw doctor --fix
-openclaw gateway restart
+#!/bin/bash
+tailscale set --exit-node=
 ```
+Stop and start (not reboot) the instance.
+
+---
+
+## Documentation
+
+| File | Contents |
+|------|---------|
+| [HANDOVER.md](HANDOVER.md) | Full architecture, configuration, issue history |
+| [SETUP.md](SETUP.md) | Step-by-step setup from scratch |
+| [CLI_ROUTER.md](CLI_ROUTER.md) | Router v5 technical deep-dive |
+| [TAILSCALE_SETUP.md](TAILSCALE_SETUP.md) | Network/VPN details |
+| [VPS_SETUP_JOURNAL.md](VPS_SETUP_JOURNAL.md) | Chronological build history |
+
+Last updated: 2026-02-23

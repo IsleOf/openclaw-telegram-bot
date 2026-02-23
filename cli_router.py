@@ -1,182 +1,523 @@
 #!/usr/bin/env python3
 """
-CLI Router with Format Conversion for OpenClaw
-Converts CLI tool output to OpenAI-compatible API format
+OpenClaw-to-OpenCode Router v5
 
-Features:
-- Wraps OpenCode CLI commands
-- Converts string responses to OpenClaw-compatible array format
-- Provides OpenAI-compatible /v1/chat/completions endpoint
-
-Usage:
-    python3 cli_router.py
-    
-Test:
-    curl -s -X POST "http://127.0.0.1:4097/v1/chat/completions" \
-      -H "Content-Type: application/json" \
-      -d '{"model": "opencode/kimi-k2.5-free", "messages": [{"role": "user", "content": "Hello"}]}'
-
-Format Conversion:
-    Input (from OpenCode CLI):
-        "Hello! How can I help you today?"
-    
-    Output (to OpenClaw):
-        [{"type": "text", "text": "Hello! How can I help you today?"}]
+Key fixes over v4:
+  BUG FIX: History accumulation loop now correctly tracks total length
+            (v4 never updated history_text so ALL 246+ messages were included,
+             filling the 12000 char limit and cutting off the user message entirely)
+  NEW: Pre-execution layer - actually runs web_search.py / web_fetch.py before
+       calling the LLM, so the model synthesizes real data instead of listing
+       imaginary capabilities
+  NEW: User message is ALWAYS included (truncate from history, not from end)
+  NEW: Intent detection for news, search, weather, system status queries
 """
-
-import json
-import subprocess
-import os
-import re
-import time
+import json, subprocess, os, re, time, sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+LOG = '/tmp/router_debug.log'
+MODEL = os.environ.get('ROUTER_MODEL', 'opencode/minimax-m2.5-free')
+OPENCODE = os.environ.get('OPENCODE_BIN', '/home/ubuntu/.opencode/bin/opencode')
+TIMEOUT = int(os.environ.get('ROUTER_TIMEOUT', '300'))
+TOOL_TIMEOUT = 30  # seconds for pre-exec tool calls
 
-def clean_output(text):
-    """Clean ANSI codes and build messages from CLI output"""
-    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
-    lines = []
-    for line in text.split("\n"):
-        line = line.strip()
-        if line and not line.startswith(">") and "build" not in line.lower():
-            lines.append(line)
-    return "\n".join(lines).strip()
+WORKSPACE = '/home/ubuntu/.openclaw/workspace'
+SKILLS_DIR = f'{WORKSPACE}/skills/web-browser/scripts'
+WEB_SEARCH = f'{SKILLS_DIR}/web_search.py'
+WEB_FETCH = f'{SKILLS_DIR}/web_fetch.py'
+
+# Prompt size limits
+MAX_PROMPT_CHARS = 10000
+MAX_SYSTEM_CHARS = 2000
+MAX_HISTORY_CHARS = 2500
+MAX_TOOL_RESULT_CHARS = 3000
 
 
-def extract_text(content):
-    """Extract text from OpenAI format (handles string or array)"""
+def log(msg):
+    with open(LOG, 'a') as f:
+        f.write(f'[{time.strftime("%H:%M:%S")}] {msg}\n')
+
+
+def content_to_text(content):
+    """Convert OpenAI content (string or array of parts) to plain text."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts = []
-        for part in content:
-            if isinstance(part, str):
-                parts.append(part)
-            elif isinstance(part, dict):
-                parts.append(part.get("text", "") or part.get("content", ""))
-        return " ".join(parts)
-    return str(content)
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict):
+                if p.get('type') == 'text':
+                    parts.append(p.get('text', ''))
+                elif p.get('type') == 'tool_result':
+                    parts.append(f"[Tool result: {p.get('content', '')}]")
+        return '\n'.join(parts)
+    return str(content) if content else ''
 
 
-def convert_to_openclaw_format(text_response):
+def clean_user_msg(text):
+    """Strip OpenClaw's 'Conversation info (untrusted metadata)' wrapper."""
+    cleaned = re.sub(
+        r'Conversation info \(untrusted metadata\):\s*```json\s*\{[^}]*\}\s*```\s*',
+        '', text
+    ).strip()
+    return cleaned
+
+
+def compress_system_prompt(text):
     """
-    Convert plain text to OpenClaw expected format
-    OpenClaw expects: [{"type": "text", "text": "response"}]
+    Extract essential identity and behavior from OpenClaw's 26K system prompt.
+    Return a minimal ~2K char version.
     """
-    return [{"type": "text", "text": text_response}]
+    if not text or len(text) < 500:
+        return text
 
+    essential_parts = []
+
+    # Try to extract IDENTITY.md content
+    identity_match = re.search(
+        r'(?:## Identity|# Identity|IDENTITY\.md)(.*?)(?=\n#|\n===|\Z)',
+        text, re.DOTALL | re.IGNORECASE
+    )
+    if identity_match:
+        essential_parts.append(identity_match.group(1).strip()[:400])
+
+    # Extract user context
+    user_match = re.search(
+        r'(?:## User|# User|USER\.md)(.*?)(?=\n#|\n===|\Z)',
+        text, re.DOTALL | re.IGNORECASE
+    )
+    if user_match:
+        essential_parts.append(user_match.group(1).strip()[:200])
+
+    # Extract behavior/personality rules
+    for pattern in [
+        r'(?:## Behavior|## Rules|## Instructions)(.*?)(?=\n#|\n===|\Z)',
+        r'(?:## Core Personality|## Personality)(.*?)(?=\n#|\n===|\Z)',
+    ]:
+        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if match:
+            essential_parts.append(match.group(1).strip()[:300])
+            break
+
+    # Core identity prefix — always included
+    prefix = (
+        "You are Claw 🦞, an AI assistant running on a VPS. "
+        "User: DaN (@Iselter). "
+        "Be direct, concise, opinionated. Do the task, don't describe what you could do. "
+        "When given web search results or tool output, synthesize them into a useful answer."
+    )
+
+    if essential_parts:
+        body = '\n\n'.join(essential_parts)
+    else:
+        # Fallback: first non-JSON lines up to limit
+        lines = []
+        for line in text.split('\n'):
+            if re.match(r'^\s*[\{\}"|\u251c\u2514\u2502]', line):
+                continue
+            if re.search(r'additionalProperties|parameters.*schema|enum:', line):
+                continue
+            lines.append(line)
+            if len('\n'.join(lines)) > 800:
+                break
+        body = '\n'.join(lines)
+
+    result = prefix + '\n\n' + body
+    return result[:MAX_SYSTEM_CHARS]
+
+
+# ─── Intent detection & pre-execution ───────────────────────────────────────
+
+ESTONIAN_NEWS_KEYWORDS = [
+    'estonian news', 'estonia news', 'eesti uudised', 'eesti uudis',
+    'err.ee', 'postimees', 'delfi', 'estonian', 'estonia',
+]
+
+def detect_intent(user_msg):
+    """Return (intent, query) tuple. Intent: 'estonian_news', 'web_search', 'web_fetch', None."""
+    msg_lower = user_msg.lower()
+
+    # Estonian news
+    if any(kw in msg_lower for kw in ESTONIAN_NEWS_KEYWORDS):
+        if any(w in msg_lower for w in ['news', 'uudis', 'report', 'today', 'latest', 'what', 'tell']):
+            return ('estonian_news', user_msg)
+
+    # Explicit web search
+    if re.search(r'\b(search|look up|find|google|research|web)\b', msg_lower):
+        # Extract query after "search for", "look up", etc.
+        query_match = re.search(
+            r'(?:search(?:\s+for)?|look\s+up|find|google|research)\s+(.+)', msg_lower
+        )
+        if query_match:
+            return ('web_search', query_match.group(1).strip())
+        return ('web_search', user_msg)
+
+    # URL in message — fetch it
+    url_match = re.search(r'https?://\S+', user_msg)
+    if url_match:
+        return ('web_fetch', url_match.group(0))
+
+    return (None, user_msg)
+
+
+def run_tool(cmd, timeout=TOOL_TIMEOUT):
+    """Run a shell command and return stdout, stripping ANSI and warning lines."""
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            cwd='/home/ubuntu'
+        )
+        out = result.stdout + result.stderr
+        # Strip ANSI
+        out = re.sub(r'\x1b\[[0-9;]*m', '', out)
+        # Strip "Impersonate ... does not exist" warnings
+        out = '\n'.join(
+            l for l in out.split('\n')
+            if not l.startswith('Impersonate')
+        ).strip()
+        return out
+    except subprocess.TimeoutExpired:
+        return None
+    except Exception as e:
+        log(f'Tool error: {e}')
+        return None
+
+
+def fetch_estonian_news():
+    """Fetch Estonian news headlines via web search + err.ee."""
+    log('Pre-exec: fetching Estonian news')
+    results = []
+
+    # Search for today's news
+    search_out = run_tool([
+        'python3', WEB_SEARCH,
+        '--query', 'Estonia news today site:err.ee OR site:postimees.ee OR site:delfi.ee',
+        '--max-results', '6'
+    ])
+    if search_out:
+        try:
+            data = json.loads(search_out)
+            for item in data[:6]:
+                title = item.get('title', '')
+                snippet = item.get('snippet', '')[:200]
+                url = item.get('url', '')
+                results.append(f"• {title}\n  {snippet}\n  {url}")
+        except Exception:
+            results.append(search_out[:1000])
+
+    # Also try a general search
+    if not results:
+        search_out2 = run_tool([
+            'python3', WEB_SEARCH,
+            '--query', f'Estonia news {time.strftime("%B %Y")}',
+            '--max-results', '5'
+        ])
+        if search_out2:
+            try:
+                data = json.loads(search_out2)
+                for item in data[:5]:
+                    title = item.get('title', '')
+                    snippet = item.get('snippet', '')[:200]
+                    results.append(f"• {title}\n  {snippet}")
+            except Exception:
+                results.append(search_out2[:800])
+
+    if results:
+        return 'LIVE WEB DATA (Estonian news):\n' + '\n\n'.join(results)
+    return None
+
+
+def do_web_search(query):
+    """Run DuckDuckGo search and return formatted results."""
+    log(f'Pre-exec: web search "{query[:60]}"')
+    out = run_tool([
+        'python3', WEB_SEARCH,
+        '--query', query,
+        '--max-results', '5'
+    ])
+    if not out:
+        return None
+    try:
+        data = json.loads(out)
+        lines = []
+        for item in data[:5]:
+            title = item.get('title', '')
+            snippet = item.get('snippet', '')[:200]
+            url = item.get('url', '')
+            lines.append(f"• {title}\n  {snippet}\n  {url}")
+        return 'LIVE WEB SEARCH RESULTS:\n' + '\n\n'.join(lines)
+    except Exception:
+        return f'SEARCH RESULTS:\n{out[:1000]}'
+
+
+def do_web_fetch(url):
+    """Fetch a URL and return readable text."""
+    log(f'Pre-exec: web fetch {url[:80]}')
+    out = run_tool([
+        'python3', WEB_FETCH,
+        '--url', url,
+        '--max-chars', '3000'
+    ])
+    if out:
+        return f'FETCHED CONTENT from {url}:\n{out[:2000]}'
+    return None
+
+
+def pre_execute_tools(user_msg):
+    """
+    Detect user intent and pre-execute appropriate tools.
+    Returns tool_context string to inject into prompt, or None.
+    """
+    intent, param = detect_intent(user_msg)
+    log(f'Intent detected: {intent}')
+
+    if intent == 'estonian_news':
+        return fetch_estonian_news()
+    elif intent == 'web_search':
+        return do_web_search(param)
+    elif intent == 'web_fetch':
+        return do_web_fetch(param)
+    return None
+
+
+# ─── Prompt assembly ─────────────────────────────────────────────────────────
+
+def build_prompt(messages, tools=None):
+    """
+    Build a compact prompt for the LLM.
+
+    v5 changes:
+    - History is properly limited (fixes v4 bug where history_text never updated)
+    - User message is ALWAYS included (truncate history, not the end of the prompt)
+    - Tool results are injected before the user message
+    """
+    system_text = ''
+    history_entries = []
+    last_user_msg = ''
+
+    for msg in messages:
+        role = msg.get('role', '')
+        text = content_to_text(msg.get('content', ''))
+
+        if role == 'system':
+            system_text = text
+        elif role == 'user':
+            last_user_msg = text
+            cleaned = clean_user_msg(text)
+            if cleaned:
+                history_entries.append(('user', cleaned))
+        elif role == 'assistant':
+            if text:
+                truncated = text[:200] + '…' if len(text) > 200 else text
+                history_entries.append(('assistant', truncated))
+            for tc in msg.get('tool_calls', []):
+                fn = tc.get('function', {})
+                history_entries.append(('tool_call', f"{fn.get('name','?')}({fn.get('arguments','')[:60]})"))
+        elif role == 'tool':
+            history_entries.append(('tool_result', text[:150]))
+
+    # Clean current user message
+    current_user = clean_user_msg(last_user_msg)
+
+    # Pre-execute tools based on intent
+    tool_context = None
+    if current_user:
+        tool_context = pre_execute_tools(current_user)
+        if tool_context:
+            tool_context = tool_context[:MAX_TOOL_RESULT_CHARS]
+
+    # Build compressed system prompt
+    sys_compressed = compress_system_prompt(system_text) if system_text else (
+        "You are Claw 🦞, a direct AI assistant. User: DaN. Be concise, do tasks, don't describe capabilities."
+    )
+
+    # Build history — CORRECTLY limit to MAX_HISTORY_CHARS
+    # Take most recent entries that fit
+    history_lines = []
+    history_total = 0
+    for role, text in reversed(history_entries[:-1]):  # exclude last user (added separately)
+        prefix = {'user': 'U', 'assistant': 'A', 'tool_call': 'T', 'tool_result': 'R'}.get(role, role[0].upper())
+        line = f'{prefix}: {text}'
+        if history_total + len(line) + 1 > MAX_HISTORY_CHARS:
+            break
+        history_lines.insert(0, line)
+        history_total += len(line) + 1
+
+    # Assemble prompt — user message is ALWAYS present
+    parts = [sys_compressed, '']
+
+    if history_lines:
+        parts.append('--- Recent ---')
+        parts.extend(history_lines)
+        parts.append('---')
+        parts.append('')
+
+    if tool_context:
+        parts.append(tool_context)
+        parts.append('')
+
+    parts.append(f'USER: {current_user}')
+    parts.append('')
+    parts.append('Respond:')
+
+    prompt = '\n'.join(parts)
+
+    # Safety truncation — never truncate past the user message
+    if len(prompt) > MAX_PROMPT_CHARS:
+        # Find position of user message block and protect it
+        user_marker = f'USER: {current_user}'
+        user_pos = prompt.rfind(user_marker)
+        if user_pos > 0:
+            # Truncate only the beginning (history/system)
+            overage = len(prompt) - MAX_PROMPT_CHARS
+            prompt = prompt[overage:]
+            log(f'Truncated {overage} chars from start to protect user message')
+        else:
+            prompt = prompt[:MAX_PROMPT_CHARS]
+
+    log(f'Prompt built: {len(prompt)} chars, tool_context: {bool(tool_context)}, history_entries: {len(history_lines)}')
+    return prompt
+
+
+# ─── HTTP Handler ─────────────────────────────────────────────────────────────
 
 class RouterHandler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
     def log_message(self, fmt, *args):
-        """Suppress default logging"""
-        pass
+        log(f'HTTP: {fmt % args}')
 
     def do_GET(self):
-        """Handle GET requests"""
-        if self.path == "/v1/models":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(
-                json.dumps(
-                    {
-                        "object": "list",
-                        "data": [{"id": "opencode/kimi-k2.5-free", "object": "model"}],
-                    }
-                ).encode()
-            )
+        if self.path == '/v1/models':
+            self._json({'object': 'list', 'data': [
+                {'id': MODEL, 'object': 'model'},
+                {'id': 'opencode/minimax-m2.5-free', 'object': 'model'},
+                {'id': 'opencode/trinity-large-preview-free', 'object': 'model'},
+                {'id': 'opencode/glm-5-free', 'object': 'model'},
+            ]})
         else:
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(
-                json.dumps(
-                    {
-                        "status": "CLI Router with Format Conversion",
-                        "endpoints": ["/v1/models", "/v1/chat/completions"],
-                        "format": "Converts CLI output to OpenClaw array format",
-                    }
-                ).encode()
-            )
+            self._json({'status': 'openclaw router v5'})
 
     def do_POST(self):
-        """Handle POST requests"""
-        if self.path == "/v1/chat/completions":
-            try:
-                content_length = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(content_length))
+        length = int(self.headers.get('Content-Length', 0))
+        body = json.loads(self.rfile.read(length))
+        model = body.get('model', MODEL)
+        messages = body.get('messages', [])
+        is_stream = body.get('stream', False)
+        tools = body.get('tools', [])
 
-                model = body.get("model", "opencode/kimi-k2.5-free")
-                messages = body.get("messages", [])
+        msg_count = len(messages)
+        sys_len = sum(len(content_to_text(m.get('content', ''))) for m in messages if m.get('role') == 'system')
+        last_user_preview = ''
+        for m in reversed(messages):
+            if m.get('role') == 'user':
+                last_user_preview = clean_user_msg(content_to_text(m.get('content', '')))[:80]
+                break
+        log(f'POST msgs={msg_count} sys={sys_len} model={model} user="{last_user_preview}"')
 
-                # Extract user prompt
-                prompt = ""
-                for msg in reversed(messages):
-                    if msg.get("role") == "user":
-                        prompt = extract_text(msg.get("content", ""))
-                        break
+        if self.path not in ('/v1/chat/completions', '/v1/completions'):
+            self._json({'error': 'not found'}, 404)
+            return
 
-                if not prompt:
-                    self.send_error(400, "No user message")
-                    return
+        # Build prompt (includes tool pre-execution)
+        prompt = build_prompt(messages, tools)
 
-                # Call OpenCode CLI
-                env = os.environ.copy()
-                env["PATH"] = "/home/ubuntu/.opencode/bin:" + env.get("PATH", "")
+        # Map model names
+        actual_model = model
+        if 'kimi' in model.lower():
+            actual_model = 'opencode/glm-5-free'
 
-                try:
-                    result = subprocess.run(
-                        ["opencode", "run", "-m", model, prompt],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                        env=env,
-                        cwd="/home/ubuntu",
-                    )
-                    raw_output = result.stdout + result.stderr
-                    cleaned = clean_output(raw_output) or "No response"
-                except Exception as e:
-                    cleaned = f"Error: {str(e)}"
+        # Call OpenCode CLI
+        env = os.environ.copy()
+        env['PATH'] = os.path.dirname(OPENCODE) + ':' + env.get('PATH', '')
+        try:
+            result = subprocess.run(
+                [OPENCODE, 'run', '-m', actual_model, prompt],
+                capture_output=True, text=True, timeout=TIMEOUT,
+                env=env, cwd='/home/ubuntu'
+            )
+            raw = result.stdout + result.stderr
+            # Clean ANSI
+            cleaned = re.sub(r'\x1b\[[0-9;]*m', '', raw)
+            # Remove opencode startup noise
+            lines = []
+            for line in cleaned.split('\n'):
+                line = line.strip()
+                if line and not line.startswith('>') and 'build' not in line.lower()[:20]:
+                    lines.append(line)
+            cleaned = '\n'.join(lines).strip() or 'No response'
+            log(f'LLM response ({len(cleaned)} chars): {cleaned[:150]}')
+        except subprocess.TimeoutExpired:
+            cleaned = f'Taking longer than {TIMEOUT}s — free model is still working. Try again in a moment.'
+            log(f'TIMEOUT after {TIMEOUT}s')
+        except Exception as e:
+            cleaned = f'Router error: {e}'
+            log(f'Error: {e}')
 
-                # FORMAT CONVERSION: Wrap in array format for OpenClaw
-                formatted_content = convert_to_openclaw_format(cleaned)
+        ts = int(time.time())
+        chat_id = f'chatcmpl-{ts}'
+        prompt_tokens = max(len(prompt.split()), 1)
+        completion_tokens = max(len(cleaned.split()), 1)
 
-                # Build OpenAI-compatible response
-                timestamp = int(time.time())
-                response = {
-                    "id": f"chatcmpl-{timestamp}",
-                    "object": "chat.completion",
-                    "created": timestamp,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": formatted_content,  # ARRAY FORMAT
-                            },
-                            "finish_reason": "stop",
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": len(prompt.split()),
-                        "completion_tokens": len(cleaned.split()),
-                        "total_tokens": len(prompt.split()) + len(cleaned.split()),
-                    },
-                }
-
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(response).encode())
-
-            except Exception as e:
-                self.send_error(500, str(e))
+        if is_stream:
+            self._stream_response(chat_id, ts, model, cleaned, prompt_tokens, completion_tokens, body)
         else:
-            self.send_error(404)
+            self._json({
+                'id': chat_id, 'object': 'chat.completion', 'created': ts, 'model': model,
+                'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': cleaned}, 'finish_reason': 'stop'}],
+                'usage': {'prompt_tokens': prompt_tokens, 'completion_tokens': completion_tokens, 'total_tokens': prompt_tokens + completion_tokens}
+            })
+
+    def _stream_response(self, chat_id, ts, model, text, prompt_tokens, completion_tokens, body):
+        chunks = [
+            'data: ' + json.dumps({
+                'id': chat_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model,
+                'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]
+            }) + '\n\n',
+            'data: ' + json.dumps({
+                'id': chat_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model,
+                'choices': [{'index': 0, 'delta': {'content': text}, 'finish_reason': None}]
+            }) + '\n\n',
+        ]
+        finish = {
+            'id': chat_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model,
+            'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}],
+        }
+        if body.get('stream_options', {}).get('include_usage'):
+            finish['usage'] = {
+                'prompt_tokens': prompt_tokens,
+                'completion_tokens': completion_tokens,
+                'total_tokens': prompt_tokens + completion_tokens
+            }
+        chunks.append('data: ' + json.dumps(finish) + '\n\n')
+        chunks.append('data: [DONE]\n\n')
+
+        payload = ''.join(chunks).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'close')
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
+        log(f'Streamed {len(text)} chars')
+
+    def _json(self, data, code=200):
+        payload = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(payload)))
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        self.wfile.write(payload)
 
 
-if __name__ == "__main__":
-    print("[ROUTER] Starting CLI Router with Format Conversion on 127.0.0.1:4097")
-    print("[ROUTER] Format: Converts CLI string output to OpenClaw array format")
-    HTTPServer(("127.0.0.1", 4097), RouterHandler).serve_forever()
+if __name__ == '__main__':
+    port = int(os.environ.get('ROUTER_PORT', '4097'))
+    log(f'=== OpenClaw Router v5 starting on 0.0.0.0:{port} ===')
+    log(f'Model: {MODEL}, Timeout: {TIMEOUT}s')
+    server = HTTPServer(('0.0.0.0', port), RouterHandler)
+    server.serve_forever()

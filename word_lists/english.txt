@@ -1,0 +1,28 @@
+# English word library for Whisper speech recognition
+# Domain-specific vocabulary relevant to this user's context
+
+# Estonia in English context
+Estonia Estonian Tallinn Tartu NATO Baltic defense Russia Ukraine
+Riigikogu prime minister president coalition opposition parliament
+EKRE Reform Party Isamaa Social Democrats Center Party
+
+# Tech stack this user uses
+OpenClaw OpenCode VPS AWS EC2 API webhook router systemd
+Telegram bot Tailscale SSH Ubuntu Linux Python JavaScript Node.js
+Claude Anthropic GPT OpenAI Gemini Google Whisper Groq
+faster-whisper transcription speech-to-text LLM prompt context
+GitHub git commit deploy docker nginx flask uvicorn
+
+# Common English conversational fillers (for rewriter to remove)
+um uh like you know basically literally actually honestly
+I mean kind of sort of right so yeah okay well
+
+# News and geopolitics
+intelligence report military defense spending GDP percent
+sanctions drone ammunition artillery battalion brigade
+NATO member article five collective defense deterrence
+war conflict ceasefire peace talks negotiations
+
+# Numbers and statistics (helps with financial/political contexts)
+percent percentage million billion thousand
+quarterly annually revenue growth forecast

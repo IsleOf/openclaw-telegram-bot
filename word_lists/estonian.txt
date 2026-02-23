@@ -1,0 +1,43 @@
+# Estonian word library for Whisper speech recognition
+# Used as initial_prompt to improve recognition of Estonian vocabulary
+# Whisper sees this as preceding context, biasing toward these words/patterns
+
+# Place names
+Tallinn Tartu Narva Pärnu Viljandi Rakvere Jõhvi Haapsalu Kuressaare Võru
+Kohtla-Järve Sillamäe Valga Põlva Jõgeva Rapla Kärdla Paide
+Lasnamäe Mustamäe Kristiine Nõmme Pirita Kesklinn Põhja-Tallinn
+Haabersti Lasnamäe Viimsi Maardu Saue Keila
+
+# Government and politics
+Riigikogu peaminister president minister valitsus ministeerium
+Erakond Koalitsioon Opositsioon Reformierakond Keskerakond EKRE Isamaa
+Sotsiaaldemokraadid Eesti 200 Rohelised fraktsioon seadus
+Toomas Hendrik Ilves Alar Karis Kaja Kallas Kristen Michal
+Martin Helme Mart Helme Jüri Ratas Ülo Mattheus
+
+# Military and security
+kaitsevägi NATO liitlased rünnak kaitsmine sõjavägi
+dessant pataljon brigaad diviis polk kompanii
+sõda rahu relvarahu rahuvalve piirivahtkond
+kaitsepolitsei KAPO välisluuret Eesti välisluureamet
+Kaupo Rosin Henrik Praks droon mehitamata lennumasin
+
+# Estonian media
+ERR Postimees Delfi Õhtuleht Eesti Päevaleht Maaleht Äripäev
+Err.ee Postimees.ee Delfi.ee uudised uudis reportaaž saade
+Vikerraadio Raadio 2 ETV ETV2 ETVPlus Kanal 2 TV3
+
+# Economy and tech
+majandus ettevõte startup investeering turg börs
+tehisintellekt AI andmed pilv programmeerimine arendaja
+Ülemiste City Tehnopol Garage48 Skype Pipedrive Bolt Wise TransferWise
+
+# Common Estonian conversational words (often missed by ASR)
+täpselt loomulikult muidugi tegelikult absoluutselt selge
+ausalt öeldes ühesõnaga kokkuvõttes põhimõtteliselt
+aga jah aga ei just täpselt nii ongi ütleme nii
+noh ee nagu siis nii et tähendab vaata kuule
+
+# Filler words (listed here so Whisper recognizes them for the rewriter to remove)
+noh ee eem nagu siis tähendab vaata kuule põhimõtteliselt
+ütleme nii niiöelda üks asi on see et teisest küljest

@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-OpenClaw-to-OpenCode Router v5
+OpenClaw-to-OpenCode Router v6
 
-Key fixes over v4:
-  BUG FIX: History accumulation loop now correctly tracks total length
-            (v4 never updated history_text so ALL 246+ messages were included,
-             filling the 12000 char limit and cutting off the user message entirely)
-  NEW: Pre-execution layer - actually runs web_search.py / web_fetch.py before
-       calling the LLM, so the model synthesizes real data instead of listing
-       imaginary capabilities
-  NEW: User message is ALWAYS included (truncate from history, not from end)
-  NEW: Intent detection for news, search, weather, system status queries
+Changes over v5:
+  NEW: sentiment_research intent — runs sentiment_research.py (polls + social media
+       + party positions + news) and formats structured JSON for LLM synthesis
+  NEW: format_sentiment_data() converts research JSON into readable report context
+  Updated: intent detection expanded with social/sentiment/polls keywords
 """
 import json, subprocess, os, re, time, sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -19,18 +15,20 @@ LOG = '/tmp/router_debug.log'
 MODEL = os.environ.get('ROUTER_MODEL', 'opencode/minimax-m2.5-free')
 OPENCODE = os.environ.get('OPENCODE_BIN', '/home/ubuntu/.opencode/bin/opencode')
 TIMEOUT = int(os.environ.get('ROUTER_TIMEOUT', '300'))
-TOOL_TIMEOUT = 30  # seconds for pre-exec tool calls
+TOOL_TIMEOUT = 30        # seconds for basic tool calls
+SENTIMENT_TIMEOUT = 90   # seconds for deep research (multiple fetches)
 
 WORKSPACE = '/home/ubuntu/.openclaw/workspace'
 SKILLS_DIR = f'{WORKSPACE}/skills/web-browser/scripts'
 WEB_SEARCH = f'{SKILLS_DIR}/web_search.py'
 WEB_FETCH = f'{SKILLS_DIR}/web_fetch.py'
+SENTIMENT_TOOL = f'{SKILLS_DIR}/sentiment_research.py'
 
 # Prompt size limits
 MAX_PROMPT_CHARS = 10000
 MAX_SYSTEM_CHARS = 2000
 MAX_HISTORY_CHARS = 2500
-MAX_TOOL_RESULT_CHARS = 3000
+MAX_TOOL_RESULT_CHARS = 4000  # larger for research results
 
 
 def log(msg):
@@ -135,9 +133,23 @@ ESTONIAN_NEWS_KEYWORDS = [
     'err.ee', 'postimees', 'delfi', 'estonian', 'estonia',
 ]
 
+SENTIMENT_KEYWORDS = [
+    'sentiment', 'public opinion', 'what do people think', 'what are people saying',
+    'what are conservatives', 'what are liberals', 'social media', 'facebook',
+    'twitter', 'polls', 'poll', 'survey', 'opinion poll', 'population thinks',
+    'citizens think', 'society thinks', 'public view', 'community thinks',
+    'what does society', 'population sentiment', 'deep research', 'scientific research',
+    'how do estonians', 'eestlased', 'hoiakud', 'rahvaküsitlus', 'küsitlus',
+    'what do estonians think', 'estonian opinion', 'citizen sentiment',
+]
+
 def detect_intent(user_msg):
-    """Return (intent, query) tuple. Intent: 'estonian_news', 'web_search', 'web_fetch', None."""
+    """Return (intent, query) tuple."""
     msg_lower = user_msg.lower()
+
+    # Sentiment / deep research — check before news/search (more specific)
+    if any(kw in msg_lower for kw in SENTIMENT_KEYWORDS):
+        return ('sentiment_research', user_msg)
 
     # Estonian news
     if any(kw in msg_lower for kw in ESTONIAN_NEWS_KEYWORDS):
@@ -146,7 +158,6 @@ def detect_intent(user_msg):
 
     # Explicit web search
     if re.search(r'\b(search|look up|find|google|research|web)\b', msg_lower):
-        # Extract query after "search for", "look up", etc.
         query_match = re.search(
             r'(?:search(?:\s+for)?|look\s+up|find|google|research)\s+(.+)', msg_lower
         )
@@ -160,6 +171,76 @@ def detect_intent(user_msg):
         return ('web_fetch', url_match.group(0))
 
     return (None, user_msg)
+
+
+def format_sentiment_data(data):
+    """Convert sentiment_research.py JSON output into a readable context for the LLM."""
+    lines = [f'DEEP RESEARCH DATA — Topic: {data.get("topic", "unknown")}',
+             f'Timestamp: {data.get("timestamp", "")}', '']
+
+    # Key statistics first
+    stats = data.get('key_statistics', [])
+    if stats:
+        lines.append(f'KEY STATISTICS FOUND: {", ".join(stats[:15])}')
+        lines.append('')
+
+    # Poll data
+    polls = data.get('poll_data', [])
+    if polls:
+        lines.append('=== POLL & SURVEY DATA ===')
+        for p in polls[:5]:
+            lines.append(f'Source: {p.get("source", "")}')
+            if p.get('stats_found'):
+                lines.append(f'  Statistics: {", ".join(p["stats_found"][:8])}')
+            # Use full_content if available, otherwise excerpt
+            content = p.get('full_content') or p.get('excerpt', '')
+            if content:
+                lines.append(f'  Data: {content[:400]}')
+            lines.append('')
+
+    # Social media
+    social = data.get('social_media', [])
+    if social:
+        lines.append('=== SOCIAL MEDIA FINDINGS ===')
+        # Group by platform
+        by_platform = {}
+        for s in social:
+            plat = s.get('platform', 'unknown')
+            by_platform.setdefault(plat, []).append(s)
+        for plat, items in list(by_platform.items())[:4]:
+            lines.append(f'Platform: {plat}')
+            for item in items[:3]:
+                title = item.get('title', '')
+                snippet = item.get('snippet', '') or item.get('content', '')
+                if title or snippet:
+                    lines.append(f'  • {title[:80]}')
+                    if snippet:
+                        lines.append(f'    {snippet[:200]}')
+            lines.append('')
+
+    # Party positions
+    parties = data.get('party_positions', [])
+    if parties:
+        lines.append('=== POLITICAL PARTY POSITIONS ===')
+        seen_parties = set()
+        for p in parties:
+            party = p.get('party', '')
+            if party not in seen_parties:
+                seen_parties.add(party)
+                lines.append(f'{party}: {p.get("snippet", "")[:200]}')
+        lines.append('')
+
+    # News
+    news = data.get('news', [])
+    if news:
+        lines.append('=== RELEVANT NEWS ===')
+        for n in news[:4]:
+            lines.append(f'• {n.get("title", "")[:80]}')
+            if n.get('snippet'):
+                lines.append(f'  {n["snippet"][:150]}')
+        lines.append('')
+
+    return '\n'.join(lines)
 
 
 def run_tool(cmd, timeout=TOOL_TIMEOUT):
@@ -265,6 +346,36 @@ def do_web_fetch(url):
     return None
 
 
+def do_sentiment_research(user_msg):
+    """Run sentiment_research.py for deep social/poll/media analysis."""
+    log(f'Pre-exec: sentiment research for "{user_msg[:60]}"')
+    # Extract the core topic — strip polite framing
+    topic = re.sub(
+        r'^(please|pls|can you|i want|i need|tell me|give me|do|perform|run|'
+        r'what are|what do|how do|research|analyze|investigate|find out about)\s+',
+        '', user_msg.lower()
+    ).strip()
+    # Keep a reasonable topic length
+    topic = topic[:120]
+    try:
+        result = subprocess.run(
+            ['python3', SENTIMENT_TOOL, '--topic', topic, '--lang', 'en'],
+            capture_output=True, text=True, timeout=SENTIMENT_TIMEOUT,
+            cwd='/home/ubuntu'
+        )
+        if result.stdout:
+            data = json.loads(result.stdout)
+            formatted = format_sentiment_data(data)
+            log(f'Sentiment research complete: {len(formatted)} chars')
+            return formatted
+    except subprocess.TimeoutExpired:
+        log('Sentiment research timed out — falling back to web search')
+        return do_web_search(topic + ' public opinion poll sentiment 2026')
+    except Exception as e:
+        log(f'Sentiment research error: {e}')
+    return None
+
+
 def pre_execute_tools(user_msg):
     """
     Detect user intent and pre-execute appropriate tools.
@@ -273,7 +384,9 @@ def pre_execute_tools(user_msg):
     intent, param = detect_intent(user_msg)
     log(f'Intent detected: {intent}')
 
-    if intent == 'estonian_news':
+    if intent == 'sentiment_research':
+        return do_sentiment_research(param)
+    elif intent == 'estonian_news':
         return fetch_estonian_news()
     elif intent == 'web_search':
         return do_web_search(param)
@@ -517,7 +630,7 @@ class RouterHandler(BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     port = int(os.environ.get('ROUTER_PORT', '4097'))
-    log(f'=== OpenClaw Router v5 starting on 0.0.0.0:{port} ===')
+    log(f'=== OpenClaw Router v6 starting on 0.0.0.0:{port} ===')
     log(f'Model: {MODEL}, Timeout: {TIMEOUT}s')
     server = HTTPServer(('0.0.0.0', port), RouterHandler)
     server.serve_forever()

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-OpenClaw-to-OpenCode Router v6
+OpenClaw-to-OpenCode Router v7
 
-Changes over v5:
-  NEW: sentiment_research intent — runs sentiment_research.py (polls + social media
-       + party positions + news) and formats structured JSON for LLM synthesis
-  NEW: format_sentiment_data() converts research JSON into readable report context
-  Updated: intent detection expanded with social/sentiment/polls keywords
+Changes over v6:
+  NEW: exec_task intent — detects imperative action requests (install, run, build,
+       fix, create, deploy…) and spawns a real opencode subagent (--agent build)
+       that actually executes bash commands and returns real output.
+  NEW: do_exec_task() runs opencode with a directive "DO IT" prompt instead of a
+       conversational LLM call — the subagent uses real bash tools.
+  NEW: Exec tasks use a separate EXEC_TIMEOUT (600s) since installs take longer.
 """
 import json, subprocess, os, re, time, sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -17,6 +19,7 @@ OPENCODE = os.environ.get('OPENCODE_BIN', '/home/ubuntu/.opencode/bin/opencode')
 TIMEOUT = int(os.environ.get('ROUTER_TIMEOUT', '300'))
 TOOL_TIMEOUT = 30        # seconds for basic tool calls
 SENTIMENT_TIMEOUT = 90   # seconds for deep research (multiple fetches)
+EXEC_TIMEOUT = 600       # seconds for subagent task execution (installs, builds)
 
 WORKSPACE = '/home/ubuntu/.openclaw/workspace'
 SKILLS_DIR = f'{WORKSPACE}/skills/web-browser/scripts'
@@ -143,9 +146,21 @@ SENTIMENT_KEYWORDS = [
     'what do estonians think', 'estonian opinion', 'citizen sentiment',
 ]
 
+# Exec task: imperative action words that should trigger real subagent execution
+EXEC_PATTERNS = re.compile(
+    r'^(install|uninstall|remove|setup|deploy|configure|run |execute|start|stop|restart'
+    r'|create|build|make |fix|update|upgrade|download|clone|write|implement|add skill'
+    r'|install skill|test |generate|render|compile)',
+    re.IGNORECASE
+)
+# Words that flip exec → question (don't exec if it's a question about doing something)
+QUESTION_WORDS = re.compile(r'^(what|how|why|when|where|which|can you|could you|would|should|is there|are there)', re.IGNORECASE)
+
+
 def detect_intent(user_msg):
     """Return (intent, query) tuple."""
     msg_lower = user_msg.lower()
+    stripped = user_msg.strip()
 
     # Sentiment / deep research — check before news/search (more specific)
     if any(kw in msg_lower for kw in SENTIMENT_KEYWORDS):
@@ -155,6 +170,12 @@ def detect_intent(user_msg):
     if any(kw in msg_lower for kw in ESTONIAN_NEWS_KEYWORDS):
         if any(w in msg_lower for w in ['news', 'uudis', 'report', 'today', 'latest', 'what', 'tell']):
             return ('estonian_news', user_msg)
+
+    # Exec task: imperative verb, no question mark, not a question opener
+    if (EXEC_PATTERNS.match(stripped)
+            and not stripped.endswith('?')
+            and not QUESTION_WORDS.match(stripped)):
+        return ('exec_task', user_msg)
 
     # Explicit web search
     if re.search(r'\b(search|look up|find|google|research|web)\b', msg_lower):
@@ -376,23 +397,69 @@ def do_sentiment_research(user_msg):
     return None
 
 
+def do_exec_task(task_description, model=None):
+    """
+    Spawn a real opencode subagent (--agent build) to execute a task with bash tools.
+    Returns (exec_output, is_exec) where is_exec=True means skip normal LLM call.
+    """
+    if model is None:
+        model = MODEL
+    log(f'Exec subagent: "{task_description[:80]}"')
+
+    exec_prompt = (
+        f"You are running on an Ubuntu VPS as user ubuntu. "
+        f"Execute the following task using bash commands. "
+        f"Be a DOER not a talker: actually run commands, show real output, fix errors.\n\n"
+        f"TASK: {task_description}\n\n"
+        f"Working directory: /home/ubuntu\n"
+        f"Available: python3, pip3, npm, node, ffmpeg, git, apt (sudo), curl, wget\n"
+        f"Report exactly what you ran and what the output was. If it failed, fix it."
+    )
+
+    env = os.environ.copy()
+    env['PATH'] = os.path.dirname(OPENCODE) + ':' + env.get('PATH', '')
+
+    try:
+        result = subprocess.run(
+            [OPENCODE, 'run', '--agent', 'build', '-m', model, exec_prompt],
+            capture_output=True, text=True, timeout=EXEC_TIMEOUT,
+            env=env, cwd='/home/ubuntu'
+        )
+        raw = result.stdout + result.stderr
+        cleaned = re.sub(r'\x1b\[[0-9;]*m', '', raw)
+        lines = [l.strip() for l in cleaned.split('\n')
+                 if l.strip() and not l.strip().startswith('>') and 'build' not in l.strip().lower()[:10]]
+        output = '\n'.join(lines).strip() or 'Task completed (no output)'
+        log(f'Exec subagent done: {len(output)} chars')
+        return output
+    except subprocess.TimeoutExpired:
+        return f'Subagent timed out after {EXEC_TIMEOUT}s — the task may still be running in the background.'
+    except Exception as e:
+        log(f'Exec subagent error: {e}')
+        return f'Subagent error: {e}'
+
+
 def pre_execute_tools(user_msg):
     """
     Detect user intent and pre-execute appropriate tools.
-    Returns tool_context string to inject into prompt, or None.
+    Returns (tool_context, is_exec) — is_exec=True means return tool_context directly,
+    skipping the normal conversational LLM call.
     """
     intent, param = detect_intent(user_msg)
     log(f'Intent detected: {intent}')
 
-    if intent == 'sentiment_research':
-        return do_sentiment_research(param)
+    if intent == 'exec_task':
+        output = do_exec_task(param)
+        return (output, True)  # bypass LLM, return exec output directly
+    elif intent == 'sentiment_research':
+        return (do_sentiment_research(param), False)
     elif intent == 'estonian_news':
-        return fetch_estonian_news()
+        return (fetch_estonian_news(), False)
     elif intent == 'web_search':
-        return do_web_search(param)
+        return (do_web_search(param), False)
     elif intent == 'web_fetch':
-        return do_web_fetch(param)
-    return None
+        return (do_web_fetch(param), False)
+    return (None, False)
 
 
 # ─── Prompt assembly ─────────────────────────────────────────────────────────
@@ -436,9 +503,10 @@ def build_prompt(messages, tools=None):
 
     # Pre-execute tools based on intent
     tool_context = None
+    is_exec = False
     if current_user:
-        tool_context = pre_execute_tools(current_user)
-        if tool_context:
+        tool_context, is_exec = pre_execute_tools(current_user)
+        if tool_context and not is_exec:
             tool_context = tool_context[:MAX_TOOL_RESULT_CHARS]
 
     # Build compressed system prompt
@@ -490,8 +558,8 @@ def build_prompt(messages, tools=None):
         else:
             prompt = prompt[:MAX_PROMPT_CHARS]
 
-    log(f'Prompt built: {len(prompt)} chars, tool_context: {bool(tool_context)}, history_entries: {len(history_lines)}')
-    return prompt
+    log(f'Prompt built: {len(prompt)} chars, tool_context: {bool(tool_context)}, is_exec: {is_exec}, history_entries: {len(history_lines)}')
+    return prompt, is_exec, (tool_context if is_exec else None)
 
 
 # ─── HTTP Handler ─────────────────────────────────────────────────────────────
@@ -535,39 +603,44 @@ class RouterHandler(BaseHTTPRequestHandler):
             return
 
         # Build prompt (includes tool pre-execution)
-        prompt = build_prompt(messages, tools)
+        prompt, is_exec, exec_output = build_prompt(messages, tools)
 
         # Map model names
         actual_model = model
         if 'kimi' in model.lower():
             actual_model = 'opencode/glm-5-free'
 
-        # Call OpenCode CLI
-        env = os.environ.copy()
-        env['PATH'] = os.path.dirname(OPENCODE) + ':' + env.get('PATH', '')
-        try:
-            result = subprocess.run(
-                [OPENCODE, 'run', '-m', actual_model, prompt],
-                capture_output=True, text=True, timeout=TIMEOUT,
-                env=env, cwd='/home/ubuntu'
-            )
-            raw = result.stdout + result.stderr
-            # Clean ANSI
-            cleaned = re.sub(r'\x1b\[[0-9;]*m', '', raw)
-            # Remove opencode startup noise
-            lines = []
-            for line in cleaned.split('\n'):
-                line = line.strip()
-                if line and not line.startswith('>') and 'build' not in line.lower()[:20]:
-                    lines.append(line)
-            cleaned = '\n'.join(lines).strip() or 'No response'
-            log(f'LLM response ({len(cleaned)} chars): {cleaned[:150]}')
-        except subprocess.TimeoutExpired:
-            cleaned = f'Taking longer than {TIMEOUT}s — free model is still working. Try again in a moment.'
-            log(f'TIMEOUT after {TIMEOUT}s')
-        except Exception as e:
-            cleaned = f'Router error: {e}'
-            log(f'Error: {e}')
+        if is_exec and exec_output:
+            # Exec task: subagent already ran — return its output directly
+            cleaned = exec_output
+            log(f'Exec task complete, returning {len(cleaned)} chars directly')
+        else:
+            # Normal conversational LLM call
+            env = os.environ.copy()
+            env['PATH'] = os.path.dirname(OPENCODE) + ':' + env.get('PATH', '')
+            try:
+                result = subprocess.run(
+                    [OPENCODE, 'run', '-m', actual_model, prompt],
+                    capture_output=True, text=True, timeout=TIMEOUT,
+                    env=env, cwd='/home/ubuntu'
+                )
+                raw = result.stdout + result.stderr
+                # Clean ANSI
+                cleaned = re.sub(r'\x1b\[[0-9;]*m', '', raw)
+                # Remove opencode startup noise
+                lines = []
+                for line in cleaned.split('\n'):
+                    line = line.strip()
+                    if line and not line.startswith('>') and 'build' not in line.lower()[:20]:
+                        lines.append(line)
+                cleaned = '\n'.join(lines).strip() or 'No response'
+                log(f'LLM response ({len(cleaned)} chars): {cleaned[:150]}')
+            except subprocess.TimeoutExpired:
+                cleaned = f'Taking longer than {TIMEOUT}s — free model is still working. Try again in a moment.'
+                log(f'TIMEOUT after {TIMEOUT}s')
+            except Exception as e:
+                cleaned = f'Router error: {e}'
+                log(f'Error: {e}')
 
         ts = int(time.time())
         chat_id = f'chatcmpl-{ts}'

@@ -68,10 +68,31 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+# ─── Intent detection (mirrors router) ───────────────────────────────────────
+
+EXEC_PATTERN = re.compile(
+    r'^(install|uninstall|remove|setup|deploy|configure|run |execute|start|stop|restart'
+    r'|create|build|make |fix|update|upgrade|download|clone|write|implement|add skill'
+    r'|install skill|test |generate|render|compile)',
+    re.IGNORECASE
+)
+QUESTION_PATTERN = re.compile(
+    r'^(what|how|why|when|where|which|can you|could you|would|should|is there|are there)',
+    re.IGNORECASE
+)
+
+def is_exec_task(text: str) -> bool:
+    """True if message looks like an imperative action to execute."""
+    t = text.strip()
+    return (bool(EXEC_PATTERN.match(t))
+            and not t.endswith('?')
+            and not QUESTION_PATTERN.match(t))
+
+
 # ─── Router call ─────────────────────────────────────────────────────────────
 
-def call_router(chat_history: list, timeout=300) -> str:
-    """Send conversation to CLI Router v6 and return response."""
+def call_router(chat_history: list, timeout=700) -> str:
+    """Send conversation to CLI Router v7 and return response."""
     messages = [{'role': 'system', 'content': SYSTEM_PROMPT}] + list(chat_history)
     try:
         r = requests.post(
@@ -82,7 +103,7 @@ def call_router(chat_history: list, timeout=300) -> str:
         r.raise_for_status()
         return r.json()['choices'][0]['message']['content'].strip()
     except requests.Timeout:
-        return 'Still thinking — free model is slow. Try again in a moment.'
+        return 'Subagent timed out — task may be running in background. Check /status.'
     except Exception as e:
         log.error('Router error: %s', e)
         return f'Router error: {e}'
@@ -253,11 +274,33 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     log.info('Text from chat %s: %s', chat_id, text[:80])
     HISTORY[chat_id].append({'role': 'user', 'content': text})
 
-    # Show typing indicator
-    await ctx.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+    exec_mode = is_exec_task(text)
 
     try:
-        response = call_router(list(HISTORY[chat_id]))
+        if exec_mode:
+            # Exec tasks: send status message + keep typing alive during long wait
+            status_msg = await update.message.reply_text('⚙️ Subagent working on it...')
+
+            async def keep_typing():
+                for _ in range(70):  # ~700s max (typing every 10s)
+                    await asyncio.sleep(10)
+                    try:
+                        await ctx.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+                    except Exception:
+                        break
+
+            typing_task = asyncio.create_task(keep_typing())
+            try:
+                response = await asyncio.to_thread(call_router, list(HISTORY[chat_id]))
+            finally:
+                typing_task.cancel()
+
+            await status_msg.delete()
+        else:
+            # Normal conversational message
+            await ctx.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+            response = await asyncio.to_thread(call_router, list(HISTORY[chat_id]))
+
         HISTORY[chat_id].append({'role': 'assistant', 'content': response})
         for chunk in _split_message(response):
             await update.message.reply_text(chunk)

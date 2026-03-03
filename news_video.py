@@ -1,62 +1,133 @@
 #!/usr/bin/env python3
 """
-Estonia News Video Generator
+Claw News Video — TikTok Edition (9:16)
 
 Pipeline:
-  1. Fetch Estonia news via web_search.py
-  2. LLM generates a ~60s Estonian voiceover script
-  3. edge-tts (et-EE-AnuNeural) → audio + word-level timestamps
-  4. Pillow renders frames: current word large+white, context words dimmer
-  5. ffmpeg pipes frames + audio → MP4
-  6. Sends video to Telegram
+  1. Fetch news via web_search.py
+  2. Gemini 2.0 Flash generates ~60s Estonian voiceover script
+  3. edge-tts (et-EE-KalleNeural, baritone) → audio
+  4. faster-whisper → word timestamps
+  5. Original script words aligned to whisper timestamps
+  6. Pillow renders 720x1280 TikTok frames:
+       - Cinematic dark background (bokeh orbs + optional real image)
+       - Montserrat ExtraBold font (auto-downloaded)
+       - Word entrance scale animation + glow
+       - Progress bar, brand bar, Estonian flag stripe
+  7. ffmpeg pipes frames + audio → MP4
+  8. Sends video to Telegram
 
 Usage:
-  TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy \
-    ROUTER_URL=http://localhost:4097/v1/chat/completions \
-    python3 news_video.py
+  TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy GOOGLE_AI_KEY=zzz \\
+    ROUTER_URL=http://localhost:4097/v1/chat/completions \\
+    python3 news_video.py [--topic "global AI news"] [--chat-id 12345]
 """
-import asyncio, json, os, re, subprocess, sys, tempfile, time
+import asyncio, json, math, os, re, subprocess, sys, tempfile, time
 from pathlib import Path
 import requests
 
-# ─── CLI args (allow natural-language invocation from telegram_bot.py) ────────
+# ─── CLI args ─────────────────────────────────────────────────────────────────
 import argparse as _ap
 _parser = _ap.ArgumentParser(add_help=False)
-_parser.add_argument('--topic',   default='')   # what to make video about
-_parser.add_argument('--chat-id', default='')   # override TELEGRAM_CHAT_ID
+_parser.add_argument('--topic',   default='')
+_parser.add_argument('--chat-id', default='')
 _ARGS, _ = _parser.parse_known_args()
 
-# ─── Config ──────────────────────────────────────────────────────────────────
-SKILLS_DIR  = Path.home() / '.openclaw/workspace/skills/web-browser/scripts'
-WEB_SEARCH  = str(SKILLS_DIR / 'web_search.py')
-BOT_TOKEN   = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-CHAT_ID     = _ARGS.chat_id or os.environ.get('TELEGRAM_CHAT_ID', '')
-ROUTER_URL  = os.environ.get('ROUTER_URL',  'http://localhost:4097/v1/chat/completions')
-ROUTER_MODEL= os.environ.get('ROUTER_MODEL','opencode/minimax-m2.5-free')
-VOICE       = 'et-EE-KalleNeural'  # male Estonian neural TTS
-VOICE_PITCH = '-15Hz'              # lower pitch for baritone effect
-TOPIC       = _ARGS.topic          # '' = default Estonia news
-GOOGLE_AI_KEY = os.environ.get('GOOGLE_AI_KEY', '')  # Gemini for better Estonian
+# ─── Config ───────────────────────────────────────────────────────────────────
+SKILLS_DIR    = Path.home() / '.openclaw/workspace/skills/web-browser/scripts'
+WEB_SEARCH    = str(SKILLS_DIR / 'web_search.py')
+BOT_TOKEN     = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+CHAT_ID       = _ARGS.chat_id or os.environ.get('TELEGRAM_CHAT_ID', '')
+ROUTER_URL    = os.environ.get('ROUTER_URL',  'http://localhost:4097/v1/chat/completions')
+ROUTER_MODEL  = os.environ.get('ROUTER_MODEL', 'opencode/minimax-m2.5-free')
+GOOGLE_AI_KEY = os.environ.get('GOOGLE_AI_KEY', '')   # for script generation only
+VOICE         = 'et-EE-KertNeural'                    # male Estonian Neural TTS
+VOICE_PITCH   = '-20Hz'                               # lower for baritone
+TOPIC         = _ARGS.topic
 
-# ─── Video params ─────────────────────────────────────────────────────────────
+# ─── Video params — TikTok 9:16 ───────────────────────────────────────────────
 FPS    = 25
-WIDTH  = 1280
-HEIGHT = 720
-FONT   = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
+WIDTH  = 720
+HEIGHT = 1280
 
-# Colours
-BG_TOP     = (10, 12, 28)
-BG_BOT     = (6, 8, 18)
-EST_BLUE   = (0, 114, 206)
-EST_BLACK  = (0, 0, 0)
-EST_WHITE  = (255, 255, 255)
-COL_CUR    = (255, 255, 255)      # current word
-COL_NEAR   = (160, 170, 200)      # ±1 word
-COL_FAR    = (70, 78, 110)        # ±2 word
-COL_TICKER = (130, 145, 190)
+# ─── Font system (Montserrat ExtraBold, auto-downloaded) ──────────────────────
+_FONT_CACHE_DIR  = os.path.expanduser('~/.openclaw/fonts')
+_MONTSERRAT_PATH = os.path.join(_FONT_CACHE_DIR, 'Montserrat-ExtraBold.ttf')
+_MONTSERRAT_URL  = (
+    'https://github.com/JulietaUla/Montserrat/raw/master/fonts/ttf/'
+    'Montserrat-ExtraBold.ttf'
+)
+_FONT_FALLBACKS = [
+    '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+]
+_PIL_FONT_CACHE: dict = {}
+_BASE_FONT_PATH: str = ''
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+def _resolve_font() -> str:
+    global _BASE_FONT_PATH
+    if _BASE_FONT_PATH:
+        return _BASE_FONT_PATH
+
+    if not os.path.exists(_MONTSERRAT_PATH):
+        os.makedirs(_FONT_CACHE_DIR, exist_ok=True)
+        print('     Downloading Montserrat ExtraBold font...')
+        try:
+            r = requests.get(_MONTSERRAT_URL, timeout=30)
+            r.raise_for_status()
+            with open(_MONTSERRAT_PATH, 'wb') as f:
+                f.write(r.content)
+            print('     Font downloaded.')
+        except Exception as e:
+            print(f'     Font download failed: {e}', file=sys.stderr)
+
+    if os.path.exists(_MONTSERRAT_PATH):
+        _BASE_FONT_PATH = _MONTSERRAT_PATH
+        return _BASE_FONT_PATH
+
+    for p in _FONT_FALLBACKS:
+        if os.path.exists(p):
+            _BASE_FONT_PATH = p
+            print(f'     Using fallback font: {p}')
+            return _BASE_FONT_PATH
+
+    _BASE_FONT_PATH = ''
+    return ''
+
+
+def load_font(size: int):
+    if size in _PIL_FONT_CACHE:
+        return _PIL_FONT_CACHE[size]
+    from PIL import ImageFont
+    path = _resolve_font()
+    font = None
+    if path:
+        try:
+            font = ImageFont.truetype(path, size)
+        except Exception:
+            pass
+    if font is None:
+        font = ImageFont.load_default()
+    _PIL_FONT_CACHE[size] = font
+    return font
+
+
+# ─── Color palette (cinematic dark news broadcast) ────────────────────────────
+COL_BG_TOP   = (3,   5,  18)
+COL_BG_BOT   = (8,   3,  24)
+COL_CUR      = (255, 255, 255)
+COL_NEAR     = (145, 175, 230)
+COL_FAR      = (50,  65,  105)
+COL_ACCENT   = (0,   190, 255)
+COL_GLOW     = (0,   110, 200)
+COL_TICKER   = (90,  125, 180)
+COL_PROG_BG  = (20,  32,   58)
+COL_BRAND    = (0,   160, 240)
+EST_BLUE     = (0,   114, 206)
+EST_BLACK    = (0,     0,   0)
+EST_WHITE    = (255, 255, 255)
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def web_search(query: str, n: int = 8) -> list:
     try:
@@ -71,7 +142,7 @@ def web_search(query: str, n: int = 8) -> list:
 
 
 def call_llm(user_msg: str, system: str) -> str:
-    # Use Gemini when key is available (better multilingual quality)
+    """Script generation: Gemini 2.0 Flash first, router fallback."""
     if GOOGLE_AI_KEY:
         try:
             r = requests.post(
@@ -79,23 +150,20 @@ def call_llm(user_msg: str, system: str) -> str:
                 f'gemini-2.0-flash:generateContent?key={GOOGLE_AI_KEY}',
                 json={
                     'systemInstruction': {'parts': [{'text': system}]},
-                    'contents': [{'parts': [{'text': user_msg}]}],
-                    'generationConfig': {'temperature': 0.7, 'maxOutputTokens': 512},
+                    'contents':          [{'parts': [{'text': user_msg}]}],
+                    'generationConfig':  {'temperature': 0.7, 'maxOutputTokens': 512},
                 },
                 timeout=60,
             )
             r.raise_for_status()
             return r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
         except Exception as e:
-            print(f'[gemini error] {e} — falling back to router', file=sys.stderr)
-
-    # Fallback: CLI Router
+            print(f'[gemini] {e} — falling back to router', file=sys.stderr)
     try:
         r = requests.post(
             ROUTER_URL,
             json={
-                'model': ROUTER_MODEL,
-                'stream': False,
+                'model': ROUTER_MODEL, 'stream': False,
                 'messages': [
                     {'role': 'system', 'content': system},
                     {'role': 'user',   'content': user_msg},
@@ -109,26 +177,14 @@ def call_llm(user_msg: str, system: str) -> str:
         return f'LLM error: {e}'
 
 
-def load_font(size: int):
-    from PIL import ImageFont
-    if os.path.exists(FONT):
-        try:
-            return ImageFont.truetype(FONT, size)
-        except Exception:
-            pass
-    return ImageFont.load_default()
-
-
-# ─── Step 1: news ─────────────────────────────────────────────────────────────
+# ─── Step 1: News ─────────────────────────────────────────────────────────────
 
 def fetch_news(topic: str = '') -> str:
     today = time.strftime('%B %d %Y')
     if topic:
-        # Topic-driven: search for what the user asked about
         items  = web_search(f'{topic} news {today}', n=7)
         items += web_search(f'{topic} Eesti uudised', n=4)
     else:
-        # Default: latest Estonia news
         items  = web_search(f'Estonia news today {today}', n=7)
         items += web_search('Eesti uudised täna ERR Postimees', n=5)
     seen, lines = set(), []
@@ -158,173 +214,321 @@ def make_estonian_script(news: str, topic: str = '') -> str:
     return call_llm(prompt, system)
 
 
-# ─── Step 3: TTS + word timestamps ───────────────────────────────────────────
+# ─── Step 3: TTS + word-level alignment ───────────────────────────────────────
 
 def align_words_to_script(script_text: str, whisper_timings: list) -> list:
     """
-    Map original script words to whisper timestamps via proportional alignment.
-    Whisper timing is accurate; whisper text is not (transcription errors).
-    We keep timing from whisper but display the original script words.
+    Proportionally map original script words to whisper timestamps.
+    Timing from whisper is accurate; text is from the original script.
     """
     orig_words = re.findall(r'\S+', script_text)
     if not orig_words or not whisper_timings:
         return whisper_timings
-
     n_orig = len(orig_words)
     n_wh   = len(whisper_timings)
     result = []
-
     for i, word in enumerate(orig_words):
-        # Map original word index proportionally into whisper timing range
         wh_lo = int(i * n_wh / n_orig)
         wh_hi = int((i + 1) * n_wh / n_orig) - 1
         wh_hi = max(wh_lo, min(wh_hi, n_wh - 1))
-
-        start = whisper_timings[wh_lo][0]
-        end   = whisper_timings[wh_hi][1]
-        result.append((start, end, word))
-
+        result.append((whisper_timings[wh_lo][0], whisper_timings[wh_hi][1], word))
     return result
 
 
 async def generate_tts(text: str, audio_path: str) -> list:
-    """
-    Generate TTS audio, then use faster-whisper to get word-level timestamps.
-    Returns list of (start_s, end_s, word) tuples using ORIGINAL script words.
-    """
     import edge_tts
 
-    # Step A: Generate audio via edge-tts (male voice, lowered pitch for baritone)
     communicate = edge_tts.Communicate(text, voice=VOICE, pitch=VOICE_PITCH)
     with open(audio_path, 'wb') as af:
         async for chunk in communicate.stream():
             if chunk['type'] == 'audio':
                 af.write(chunk['data'])
 
-    # Step B: Convert MP3 → 16kHz mono WAV for Whisper
     wav_path = audio_path.replace('.mp3', '.wav')
     subprocess.run(
         ['ffmpeg', '-y', '-i', audio_path, '-ar', '16000', '-ac', '1', wav_path],
         capture_output=True, check=True
     )
 
-    # Step C: faster-whisper for timing only (text from original script)
     print('     Running faster-whisper for word timestamps...')
     from faster_whisper import WhisperModel
     model = WhisperModel('small', device='cpu', compute_type='int8')
     segments, _ = model.transcribe(
-        wav_path,
-        language='et',
-        word_timestamps=True,
-        vad_filter=True,
+        wav_path, language='et', word_timestamps=True, vad_filter=True,
     )
-
     whisper_timings = []
     for seg in segments:
         if seg.words:
             for w in seg.words:
                 whisper_timings.append((w.start, w.end, w.word.strip()))
 
-    # Step D: Replace whisper words with original script words, keep timing
     n_script = len(text.split())
-    print(f'     Aligning {n_script} script words → {len(whisper_timings)} whisper timestamps...')
+    print(f'     Aligning {n_script} script words to {len(whisper_timings)} whisper timestamps...')
     return align_words_to_script(text, whisper_timings)
 
 
-# ─── Step 4+5: Render frames → ffmpeg ─────────────────────────────────────────
+# ─── Step 4: Background ───────────────────────────────────────────────────────
+
+def _draw_orb(draw, cx: int, cy: int, radius: int, color: tuple, alpha_peak: int = 90):
+    steps = 14
+    for i in range(steps, 0, -1):
+        r = int(radius * i / steps)
+        a = int(alpha_peak * math.pow(1 - i / steps, 0.6))
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(*color, a))
+
+
+def try_fetch_background_image(topic: str):
+    """
+    Try Wikipedia then curated Unsplash CDN IDs for a dark background.
+    Returns PIL Image (RGB, 720x1280) or None.
+    """
+    from PIL import Image
+    import io
+
+    # 1. Wikipedia page thumbnail
+    wiki_map = {
+        'ai': 'Artificial intelligence',
+        'artificial intelligence': 'Artificial intelligence',
+        'estonia': 'Estonia',
+        'tech': 'Technology',
+        '': 'Artificial intelligence',
+    }
+    wiki_title = 'Artificial intelligence'
+    tl = topic.lower()
+    for key, title in wiki_map.items():
+        if key and key in tl:
+            wiki_title = title
+            break
+    try:
+        r = requests.get(
+            'https://en.wikipedia.org/w/api.php',
+            params={
+                'action': 'query', 'titles': wiki_title,
+                'prop': 'pageimages', 'format': 'json', 'pithumbsize': 1200,
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        pages = r.json()['query']['pages']
+        img_url = next(iter(pages.values())).get('thumbnail', {}).get('source', '')
+        if img_url:
+            ir = requests.get(img_url, timeout=15, headers={'User-Agent': 'ClawBot/1.0'})
+            if ir.ok and len(ir.content) > 5000:
+                img = Image.open(io.BytesIO(ir.content)).convert('RGB')
+                img = img.resize((WIDTH, HEIGHT), Image.LANCZOS)
+                print(f'     Background: Wikipedia "{wiki_title}"')
+                return img
+    except Exception as e:
+        print(f'[bg/wiki] {e}', file=sys.stderr)
+
+    # 2. Curated Unsplash CDN (dark tech/AI)
+    for pid in [
+        '1620712943543-bcc4688e7485',
+        '1518770660439-4636190af475',
+        '1639322537228-f710d846310a',
+        '1451187580459-43490279c0fa',
+    ]:
+        try:
+            url = f'https://images.unsplash.com/photo-{pid}?w={WIDTH}&h={HEIGHT}&fit=crop&q=80'
+            ir = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+            if ir.ok and 'image' in ir.headers.get('Content-Type', '') and len(ir.content) > 10000:
+                img = Image.open(io.BytesIO(ir.content)).convert('RGB')
+                img = img.resize((WIDTH, HEIGHT), Image.LANCZOS)
+                print('     Background: Unsplash')
+                return img
+        except Exception:
+            continue
+
+    return None
+
+
+def build_background(topic: str = '') -> bytes:
+    from PIL import Image, ImageDraw, ImageFilter
+
+    # Gradient base
+    base = Image.new('RGB', (WIDTH, HEIGHT))
+    d = ImageDraw.Draw(base)
+    for y in range(HEIGHT):
+        ratio = y / HEIGHT
+        col = tuple(
+            int(COL_BG_TOP[c] + (COL_BG_BOT[c] - COL_BG_TOP[c]) * ratio)
+            for c in range(3)
+        )
+        d.line([(0, y), (WIDTH - 1, y)], fill=col)
+
+    # Optional real image at dim opacity
+    real_img = try_fetch_background_image(topic)
+    if real_img:
+        ri_rgba = real_img.convert('RGBA')
+        dark    = Image.new('RGBA', (WIDTH, HEIGHT), (0, 0, 12, 200))
+        ri_rgba = Image.alpha_composite(ri_rgba, dark)
+        img = Image.alpha_composite(base.convert('RGBA'), ri_rgba).convert('RGB')
+    else:
+        img = base
+
+    # Bokeh orbs
+    orb_layer = Image.new('RGBA', (WIDTH, HEIGHT), (0, 0, 0, 0))
+    od = ImageDraw.Draw(orb_layer)
+    _draw_orb(od, WIDTH // 4,       HEIGHT // 5,       300, (0,  90, 210), alpha_peak=115)
+    _draw_orb(od, 3 * WIDTH // 4,   4 * HEIGHT // 5,   340, (85,  0, 170), alpha_peak=100)
+    _draw_orb(od, WIDTH // 2,       HEIGHT // 8,       160, (0, 150, 230), alpha_peak=55)
+    orb_layer = orb_layer.filter(ImageFilter.GaussianBlur(55))
+    img = Image.alpha_composite(img.convert('RGBA'), orb_layer).convert('RGB')
+
+    draw = ImageDraw.Draw(img)
+
+    # Top brand bar (dark overlay)
+    bar_h = 96
+    bar_ov = Image.new('RGBA', (WIDTH, bar_h), (0, 0, 10, 175))
+    merged = Image.alpha_composite(
+        img.convert('RGBA').crop((0, 0, WIDTH, bar_h)), bar_ov
+    ).convert('RGB')
+    img.paste(merged, (0, 0))
+    draw = ImageDraw.Draw(img)
+
+    brand_font = load_font(30)
+    draw.text((WIDTH // 2, bar_h // 2), 'CLAW.AI  UUDISED',
+              font=brand_font, fill=COL_BRAND, anchor='mm')
+
+    # Estonian flag stripe below brand bar
+    draw.rectangle([0,  bar_h,      WIDTH, bar_h + 7],  fill=EST_BLUE)
+    draw.rectangle([0,  bar_h + 7,  WIDTH, bar_h + 14], fill=EST_BLACK)
+    draw.rectangle([0,  bar_h + 14, WIDTH, bar_h + 21], fill=EST_WHITE)
+
+    # Bottom dark strip
+    btm_y  = HEIGHT - 160
+    btm_ov = Image.new('RGBA', (WIDTH, 160), (0, 0, 8, 155))
+    btm_merged = Image.alpha_composite(
+        img.convert('RGBA').crop((0, btm_y, WIDTH, HEIGHT)), btm_ov
+    ).convert('RGB')
+    img.paste(btm_merged, (0, btm_y))
+    draw = ImageDraw.Draw(img)
+
+    # Estonian flag at very bottom
+    draw.rectangle([0, HEIGHT - 13, WIDTH, HEIGHT - 9],  fill=EST_BLUE)
+    draw.rectangle([0, HEIGHT - 9,  WIDTH, HEIGHT - 5],  fill=EST_BLACK)
+    draw.rectangle([0, HEIGHT - 5,  WIDTH, HEIGHT],      fill=EST_WHITE)
+
+    return img.tobytes()
+
+
+# ─── Step 5: Per-frame rendering ──────────────────────────────────────────────
 
 def current_word_idx(timings: list, t: float) -> int:
-    """Index of the word being spoken at time t."""
     for i, (s, e, _) in enumerate(timings):
         if s <= t <= e:
             return i
-    # Between words: find next upcoming
     for i, (s, _, _) in enumerate(timings):
         if s > t:
             return max(0, i - 1)
     return len(timings) - 1
 
 
-def build_background() -> bytes:
-    """Pre-render background gradient as raw RGB bytes."""
-    from PIL import Image, ImageDraw
-    img = Image.new('RGB', (WIDTH, HEIGHT))
-    draw = ImageDraw.Draw(img)
-    for y in range(HEIGHT):
-        r_ratio = y / HEIGHT
-        r = int(BG_TOP[0] + (BG_BOT[0] - BG_TOP[0]) * r_ratio)
-        g = int(BG_TOP[1] + (BG_BOT[1] - BG_TOP[1]) * r_ratio)
-        b = int(BG_TOP[2] + (BG_BOT[2] - BG_TOP[2]) * r_ratio)
-        draw.line([(0, y), (WIDTH-1, y)], fill=(r, g, b))
-    # Estonian flag stripe at top (8px each: blue | black | white)
-    draw.rectangle([0,  0, WIDTH,  8], fill=EST_BLUE)
-    draw.rectangle([0,  8, WIDTH, 16], fill=EST_BLACK)
-    draw.rectangle([0, 16, WIDTH, 24], fill=EST_WHITE)
-    # Bottom dark bar
-    draw.rectangle([0, HEIGHT-48, WIDTH, HEIGHT], fill=(4, 5, 14))
-    return img.tobytes()
+def make_word_glow():
+    from PIL import Image, ImageDraw, ImageFilter
+    gw, gh = 560, 220
+    glow = Image.new('RGBA', (gw, gh), (0, 0, 0, 0))
+    d = ImageDraw.Draw(glow)
+    for i in range(10, 0, -1):
+        rx = gw // 2 * i // 10
+        ry = gh // 2 * i // 10
+        a  = int(55 * math.pow(1 - i / 10, 0.5))
+        d.ellipse([gw//2 - rx, gh//2 - ry, gw//2 + rx, gh//2 + ry],
+                  fill=(*COL_GLOW, a))
+    return glow.filter(ImageFilter.GaussianBlur(22))
 
 
-def render_words(base_bytes: bytes, timings: list, idx: int, date_str: str) -> bytes:
-    """Copy background, draw word context, return raw RGB bytes."""
+_GLOW_IMG    = None
+BASE_FONT_SIZE = 96
+
+
+def render_frame(
+    base_bytes: bytes,
+    timings:    list,
+    idx:        int,
+    date_str:   str,
+    t:          float,
+    total_s:    float,
+    cur_size:   int,
+) -> bytes:
     from PIL import Image, ImageDraw
+    global _GLOW_IMG
 
     img = Image.frombytes('RGB', (WIDTH, HEIGHT), base_bytes)
+
+    # Word glow
+    if _GLOW_IMG is None:
+        _GLOW_IMG = make_word_glow()
+    gw, gh = _GLOW_IMG.size
+    img.paste(_GLOW_IMG, (WIDTH // 2 - gw // 2, HEIGHT // 2 - gh // 2 - 15), _GLOW_IMG)
+
     draw = ImageDraw.Draw(img)
+    cx   = WIDTH  // 2
+    cy   = HEIGHT // 2 + 30    # offset down from center to account for brand bar
 
-    cx = WIDTH  // 2
-    cy = HEIGHT // 2
-
-    def word_at(offset):
+    def word_at(offset: int) -> str:
         i = idx + offset
         return timings[i][2] if 0 <= i < len(timings) else ''
 
-    def draw_centered(text, font, color, y):
+    def draw_word(text: str, font, color: tuple, y: int, shadow: bool = False):
         if not text:
             return
         bbox = draw.textbbox((0, 0), text, font=font)
-        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text((cx - w // 2, y - h // 2), text, font=font, fill=color)
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+        x = cx - w // 2
+        ty = y - h // 2
+        if shadow:
+            draw.text((x + 3, ty + 3), text, font=font, fill=(0, 0, 0))
+        draw.text((x, ty), text, font=font, fill=color)
 
-    # Load fonts (cached outside for perf — passed as closure via module-level cache)
-    f_cur  = load_font(92)
-    f_near = load_font(52)
-    f_far  = load_font(36)
-    f_tick = load_font(22)
+    f_cur  = load_font(cur_size)
+    f_near = load_font(55)
+    f_far  = load_font(37)
+    f_tick = load_font(23)
 
-    draw_centered(word_at(-2), f_far,  COL_FAR,    cy - 210)
-    draw_centered(word_at(-1), f_near, COL_NEAR,   cy - 128)
-    draw_centered(word_at( 0), f_cur,  COL_CUR,    cy)
-    draw_centered(word_at( 1), f_near, COL_NEAR,   cy + 128)
-    draw_centered(word_at( 2), f_far,  COL_FAR,    cy + 200)
+    draw_word(word_at(-2), f_far,  COL_FAR,  cy - 270)
+    draw_word(word_at(-1), f_near, COL_NEAR, cy - 155)
+    draw_word(word_at( 0), f_cur,  COL_CUR,  cy, shadow=True)
+    draw_word(word_at(+1), f_near, COL_NEAR, cy + 155)
+    draw_word(word_at(+2), f_far,  COL_FAR,  cy + 255)
 
-    # Ticker
-    draw.text((20, HEIGHT - 34), date_str, font=f_tick, fill=COL_TICKER)
+    # Progress bar
+    pb_y1, pb_y2 = HEIGHT - 118, HEIGHT - 106
+    pb_x1, pb_x2 = 55, WIDTH - 55
+    draw.rounded_rectangle([pb_x1, pb_y1, pb_x2, pb_y2], radius=5, fill=COL_PROG_BG)
+    progress = min(1.0, t / max(total_s, 0.01))
+    if progress > 0.001:
+        end_x = int(pb_x1 + (pb_x2 - pb_x1) * progress)
+        draw.rounded_rectangle([pb_x1, pb_y1, end_x, pb_y2], radius=5, fill=COL_ACCENT)
+
+    # Date ticker
+    draw.text((cx, HEIGHT - 91), date_str, font=f_tick, fill=COL_TICKER, anchor='mm')
 
     return img.tobytes()
 
 
-def generate_video(timings: list, audio_path: str, out_path: str) -> bool:
+# ─── Step 6: Video assembly ────────────────────────────────────────────────────
+
+def generate_video(timings: list, audio_path: str, out_path: str, topic: str = '') -> bool:
     if not timings:
         print('No word timings.', file=sys.stderr)
         return False
 
-    total_s = timings[-1][1] + 1.0
+    total_s      = timings[-1][1] + 1.0
     total_frames = int(total_s * FPS) + 1
-    date_str = time.strftime('Eesti Uudised — %d. %B %Y — claw.ai')
+    date_str     = time.strftime('%d. %B %Y  ·  claw.ai')
 
     print(f'Rendering {total_frames} frames ({total_s:.1f}s @ {FPS}fps)...')
 
-    bg = build_background()
+    print('     Building background (fetching image if possible)...')
+    bg = build_background(topic)
 
-    # Font cache: load once, store globally so render_words reuses them
-    global _font_cache
-    _font_cache = {
-        92: load_font(92),
-        52: load_font(52),
-        36: load_font(36),
-        22: load_font(22),
-    }
+    global _GLOW_IMG
+    _GLOW_IMG = make_word_glow()
+
+    for sz in [BASE_FONT_SIZE, 110, 100, 96, 90, 80, 55, 37, 30, 23]:
+        load_font(sz)
 
     ffmpeg = subprocess.Popen(
         [
@@ -344,16 +548,29 @@ def generate_video(timings: list, audio_path: str, out_path: str) -> bool:
         stderr=subprocess.PIPE,
     )
 
-    prev_idx = -1
-    cached_frame = None
+    prev_idx          = -1
+    word_change_frame = 0
+    cached_frame      = None
 
     for n in range(total_frames):
         t   = n / FPS
         idx = current_word_idx(timings, t)
 
-        if idx != prev_idx or cached_frame is None:
-            cached_frame = render_words(bg, timings, idx, date_str)
+        if idx != prev_idx:
+            word_change_frame = n
             prev_idx = idx
+
+        # Entrance animation: 1.25 → 1.0 over 8 frames
+        frames_since = n - word_change_frame
+        if frames_since < 8:
+            scale    = 1.25 - 0.25 * (frames_since / 8.0)
+            cur_size = int(BASE_FONT_SIZE * scale)
+        else:
+            cur_size = BASE_FONT_SIZE
+
+        # Re-render during animation or every 4 frames for progress bar
+        if frames_since < 8 or n % 4 == 0 or cached_frame is None:
+            cached_frame = render_frame(bg, timings, idx, date_str, t, total_s, cur_size)
 
         try:
             ffmpeg.stdin.write(cached_frame)
@@ -361,13 +578,13 @@ def generate_video(timings: list, audio_path: str, out_path: str) -> bool:
             break
 
         if n % 250 == 0:
-            print(f'  frame {n}/{total_frames}  word: "{timings[idx][2]}"', flush=True)
+            w = timings[idx][2] if timings else ''
+            print(f'  frame {n}/{total_frames}  "{w}"', flush=True)
 
     try:
         ffmpeg.stdin.close()
     except Exception:
         pass
-    # Read stderr then wait — avoids the communicate() stdin flush bug
     try:
         err = ffmpeg.stderr.read()
         ffmpeg.wait()
@@ -377,6 +594,7 @@ def generate_video(timings: list, audio_path: str, out_path: str) -> bool:
         except Exception:
             pass
         err = b''
+
     if ffmpeg.returncode not in (0, None):
         err_text = err.decode(errors='replace')[-600:]
         if 'Error' in err_text or 'Invalid' in err_text:
@@ -388,7 +606,7 @@ def generate_video(timings: list, audio_path: str, out_path: str) -> bool:
     return True
 
 
-# ─── Step 6: Send to Telegram ─────────────────────────────────────────────────
+# ─── Step 7: Send to Telegram ─────────────────────────────────────────────────
 
 def send_video(path: str, caption: str):
     if not BOT_TOKEN or not CHAT_ID:
@@ -399,7 +617,7 @@ def send_video(path: str, caption: str):
         r = requests.post(
             f'https://api.telegram.org/bot{BOT_TOKEN}/sendVideo',
             data={'chat_id': CHAT_ID, 'caption': caption, 'supports_streaming': 'true'},
-            files={'video': ('estonia_news.mp4', f, 'video/mp4')},
+            files={'video': ('news.mp4', f, 'video/mp4')},
             timeout=180,
         )
     if r.ok:
@@ -411,44 +629,39 @@ def send_video(path: str, caption: str):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def main():
-    topic = TOPIC  # from --topic arg or empty
+    topic = TOPIC
     label = f'"{topic}"' if topic else 'Estonia news'
-    print(f'=== Eesti Uudiste Videomasin — {label} ===\n')
+    print(f'=== Claw News Video — {label} ===\n')
 
-    # 1. News
-    print('1/6  Fetching news...')
+    print('1/5  Fetching news...')
     news = fetch_news(topic)
     if not news:
         sys.exit('Could not fetch news.')
-    print(f'     Got {news.count(chr(10)) + 1} lines.')
+    print(f'     {news.count(chr(10)) + 1} lines.')
 
-    # 2. Script
-    print('2/6  Generating Estonian voiceover script...')
+    print('2/5  Generating Estonian voiceover script (Gemini 2.0 Flash)...')
     script = make_estonian_script(news, topic)
-    print(f'     Script ({len(script)} chars):\n     {script[:120]}...\n')
+    print(f'     Script ({len(script.split())} words): {script[:100]}...\n')
 
-    # 3. TTS
     with tempfile.TemporaryDirectory() as tmp:
         audio = os.path.join(tmp, 'voice.mp3')
         out   = os.path.expanduser('~/estonia_news.mp4')
 
-        print(f'3/6  TTS: {VOICE}...')
+        print(f'3/5  TTS: {VOICE} pitch={VOICE_PITCH}...')
         timings = await generate_tts(script, audio)
         if not timings:
             sys.exit('TTS produced no word timings.')
         audio_mb = os.path.getsize(audio) / 1024 / 1024
-        print(f'     {len(timings)} words, {audio_mb:.2f} MB audio')
+        print(f'     {len(timings)} word slots, {audio_mb:.2f} MB audio')
 
-        # 4+5. Video
-        print('4/6  Rendering video...')
-        ok = generate_video(timings, audio, out)
+        print('4/5  Rendering 720x1280 TikTok video...')
+        ok = generate_video(timings, audio, out, topic)
         if not ok:
             sys.exit('Video generation failed.')
 
-    # 6. Send
     caption_topic = topic if topic else 'Eesti uudised'
     caption = f'{caption_topic} — {time.strftime("%d. %B %Y")}'
-    print('5/6  Sending to Telegram...')
+    print('5/5  Sending to Telegram...')
     send_video(out, caption)
     print('\nDone.')
 

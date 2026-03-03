@@ -4,8 +4,8 @@ Claw News Video — TikTok Edition (9:16)
 
 Pipeline:
   1. Fetch news via web_search.py
-  2. Gemini 2.0 Flash generates ~60s Estonian voiceover script
-  3. edge-tts (et-EE-KalleNeural, baritone) → audio
+  2. Gemini 2.0 Flash generates ~60s Estonian voiceover script (Cyrillic-safe)
+  3. TartuNLP public API (tambet — deep male Estonian neural voice) → WAV audio
   4. faster-whisper → word timestamps
   5. Original script words aligned to whisper timestamps
   6. Pillow renders 720x1280 TikTok frames:
@@ -21,7 +21,7 @@ Usage:
     ROUTER_URL=http://localhost:4097/v1/chat/completions \\
     python3 news_video.py [--topic "global AI news"] [--chat-id 12345]
 """
-import asyncio, json, math, os, re, subprocess, sys, tempfile, time
+import asyncio, json, math, os, re, subprocess, sys, tempfile, time, unicodedata
 from pathlib import Path
 import requests
 
@@ -40,9 +40,13 @@ CHAT_ID       = _ARGS.chat_id or os.environ.get('TELEGRAM_CHAT_ID', '')
 ROUTER_URL    = os.environ.get('ROUTER_URL',  'http://localhost:4097/v1/chat/completions')
 ROUTER_MODEL  = os.environ.get('ROUTER_MODEL', 'opencode/minimax-m2.5-free')
 GOOGLE_AI_KEY = os.environ.get('GOOGLE_AI_KEY', '')   # for script generation only
-VOICE         = 'et-EE-KertNeural'                    # male Estonian Neural TTS
-VOICE_PITCH   = '-20Hz'                               # lower for baritone
-TOPIC         = _ARGS.topic
+# TartuNLP TTS — free public API, native Estonian neural synthesis
+# Male speakers: albert, indrek, kalev, luukas, meelis, peeter, tambet
+# Female:        kylli, lee, liivika, mari, vesta
+TARTUNLP_URL     = 'https://api.tartunlp.ai/text-to-speech/v2'
+TARTUNLP_SPEAKER = os.environ.get('TARTUNLP_SPEAKER', 'tambet')  # deep male voice
+TARTUNLP_SPEED   = float(os.environ.get('TARTUNLP_SPEED', '0.95'))
+TOPIC            = _ARGS.topic
 
 # ─── Video params — TikTok 9:16 ───────────────────────────────────────────────
 FPS    = 25
@@ -199,19 +203,34 @@ def fetch_news(topic: str = '') -> str:
 
 # ─── Step 2: Estonian script ──────────────────────────────────────────────────
 
+def _strip_cyrillic(text: str) -> str:
+    """Remove any Cyrillic characters (MiniMax sometimes code-switches to Russian)."""
+    cleaned = ''.join(
+        c for c in text
+        if 'CYRILLIC' not in unicodedata.name(c, '')
+    )
+    if len(cleaned) < len(text) * 0.8:
+        print(f'[warn] Stripped {len(text)-len(cleaned)} Cyrillic chars from script', file=sys.stderr)
+    return cleaned.strip()
+
+
 def make_estonian_script(news: str, topic: str = '') -> str:
     system = (
-        'Sa oled Eesti teleuudiste diktor. Kirjuta loomulik, selge eestikeelne uudistekst. '
-        'Ära kasuta numbreid, hashtage ega kirjavahemärke peale punkti ja koma. '
-        'Ainult lihtlausetest koosnev, kõnesobilik tekst.'
+        'Sa oled Eesti teleuudiste diktor. '
+        'Kirjuta loomulik, selge eestikeelne uudistekst AINULT LADINA TÄHESTIKUS. '
+        'Eesti tähed (ä, ö, ü, õ, š, ž) on lubatud. '
+        'KEELATUD: kürillikaalftähestik, vene keel, numbrid, hashtag\'id. '
+        'Kasuta ainult punkte ja komasid. Lihtlaused, kõnesobilik tekst.'
     )
     topic_line = f'Teema: {topic}.\n\n' if topic else ''
     prompt = (
         f'{topic_line}Uudised:\n\n{news}\n\n'
         f'Kirjuta 60-sekundiline eestikeelne uudistesaate tekst. '
-        f'Maksimaalselt 120 sõna. Alusta kohe uudistega, ilma tervituseta.'
+        f'Maksimaalselt 120 sõna. Alusta kohe uudistega, ilma tervituseta. '
+        f'Kasuta ainult ladina tähestikku.'
     )
-    return call_llm(prompt, system)
+    script = call_llm(prompt, system)
+    return _strip_cyrillic(script)
 
 
 # ─── Step 3: TTS + word-level alignment ───────────────────────────────────────
@@ -236,25 +255,46 @@ def align_words_to_script(script_text: str, whisper_timings: list) -> list:
 
 
 async def generate_tts(text: str, audio_path: str) -> list:
-    import edge_tts
+    """
+    Generate speech via TartuNLP public API (native Estonian neural TTS).
+    Speaker: configurable via TARTUNLP_SPEAKER env (default: tambet — deep male).
+    Available male voices: albert, indrek, kalev, luukas, meelis, peeter, tambet
+    """
+    print(f'     TartuNLP speaker: {TARTUNLP_SPEAKER} (speed {TARTUNLP_SPEED})')
 
-    communicate = edge_tts.Communicate(text, voice=VOICE, pitch=VOICE_PITCH)
-    with open(audio_path, 'wb') as af:
-        async for chunk in communicate.stream():
-            if chunk['type'] == 'audio':
-                af.write(chunk['data'])
-
+    # TartuNLP returns WAV directly — save to wav_path
     wav_path = audio_path.replace('.mp3', '.wav')
-    subprocess.run(
-        ['ffmpeg', '-y', '-i', audio_path, '-ar', '16000', '-ac', '1', wav_path],
-        capture_output=True, check=True
+
+    # Split long texts into chunks (API handles ~300 words comfortably)
+    # For our ~120-word scripts this is never needed, but split at sentence boundaries
+    response = requests.post(
+        TARTUNLP_URL,
+        json={'text': text, 'speaker': TARTUNLP_SPEAKER, 'speed': TARTUNLP_SPEED},
+        timeout=90,
     )
+    response.raise_for_status()
+    with open(wav_path, 'wb') as f:
+        f.write(response.content)
+
+    wav_size = os.path.getsize(wav_path) / 1024
+    print(f'     WAV: {wav_size:.0f} KB')
+
+    # Resample to 16kHz mono for faster-whisper
+    wav16_path = wav_path.replace('.wav', '_16k.wav')
+    subprocess.run(
+        ['ffmpeg', '-y', '-i', wav_path, '-ar', '16000', '-ac', '1', wav16_path],
+        capture_output=True, check=True,
+    )
+
+    # Keep the original WAV for ffmpeg video assembly (better quality)
+    # but use the 16kHz version for Whisper
+    audio_path_for_ffmpeg = wav_path
 
     print('     Running faster-whisper for word timestamps...')
     from faster_whisper import WhisperModel
     model = WhisperModel('small', device='cpu', compute_type='int8')
     segments, _ = model.transcribe(
-        wav_path, language='et', word_timestamps=True, vad_filter=True,
+        wav16_path, language='et', word_timestamps=True, vad_filter=True,
     )
     whisper_timings = []
     for seg in segments:
@@ -263,8 +303,17 @@ async def generate_tts(text: str, audio_path: str) -> list:
                 whisper_timings.append((w.start, w.end, w.word.strip()))
 
     n_script = len(text.split())
-    print(f'     Aligning {n_script} script words to {len(whisper_timings)} whisper timestamps...')
+    print(f'     Aligning {n_script} script words to {len(whisper_timings)} timestamps...')
+
+    # Store the wav path for generate_video to use (not .mp3)
+    # We write a sentinel file so generate_video knows the real audio path
+    _AUDIO_WAV_OVERRIDE[0] = wav_path
+
     return align_words_to_script(text, whisper_timings)
+
+
+# Mutable singleton to pass the actual audio path from generate_tts → generate_video
+_AUDIO_WAV_OVERRIDE: list = [None]
 
 
 # ─── Step 4: Background ───────────────────────────────────────────────────────
@@ -647,15 +696,19 @@ async def main():
         audio = os.path.join(tmp, 'voice.mp3')
         out   = os.path.expanduser('~/estonia_news.mp4')
 
-        print(f'3/5  TTS: {VOICE} pitch={VOICE_PITCH}...')
+        print(f'3/5  TTS: TartuNLP/{TARTUNLP_SPEAKER} speed={TARTUNLP_SPEED}...')
         timings = await generate_tts(script, audio)
         if not timings:
             sys.exit('TTS produced no word timings.')
-        audio_mb = os.path.getsize(audio) / 1024 / 1024
+        actual_audio = _AUDIO_WAV_OVERRIDE[0] or audio
+        audio_mb = os.path.getsize(actual_audio) / 1024 / 1024
         print(f'     {len(timings)} word slots, {audio_mb:.2f} MB audio')
 
+        # TartuNLP writes WAV directly; use that for the video instead of .mp3
+        actual_audio = _AUDIO_WAV_OVERRIDE[0] or audio
+
         print('4/5  Rendering 720x1280 TikTok video...')
-        ok = generate_video(timings, audio, out, topic)
+        ok = generate_video(timings, actual_audio, out, topic)
         if not ok:
             sys.exit('Video generation failed.')
 

@@ -25,6 +25,9 @@ Environment=WHISPER_MODEL=small
 Environment=ROUTER_URL=http://localhost:4097/v1/chat/completions
 Environment=ROUTER_MODEL=opencode/minimax-m2.5-free
 
+# ── Google AI Studio (Gemini) — used for Estonian script generation ────────────
+Environment=GOOGLE_AI_KEY=AIzaSyDa-o0FGbZTUumMbzraQ7dwGkreRTE-1lU
+
 # ── Access control (optional) ─────────────────────────────────────────────────
 # Comma-separated Telegram chat IDs that can use the bot (empty = allow all)
 # Find your chat ID by messaging @userinfobot

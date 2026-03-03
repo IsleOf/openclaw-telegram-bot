@@ -19,14 +19,24 @@ import asyncio, json, os, re, subprocess, sys, tempfile, time
 from pathlib import Path
 import requests
 
+# ─── CLI args (allow natural-language invocation from telegram_bot.py) ────────
+import argparse as _ap
+_parser = _ap.ArgumentParser(add_help=False)
+_parser.add_argument('--topic',   default='')   # what to make video about
+_parser.add_argument('--chat-id', default='')   # override TELEGRAM_CHAT_ID
+_ARGS, _ = _parser.parse_known_args()
+
 # ─── Config ──────────────────────────────────────────────────────────────────
 SKILLS_DIR  = Path.home() / '.openclaw/workspace/skills/web-browser/scripts'
 WEB_SEARCH  = str(SKILLS_DIR / 'web_search.py')
 BOT_TOKEN   = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-CHAT_ID     = os.environ.get('TELEGRAM_CHAT_ID', '')
+CHAT_ID     = _ARGS.chat_id or os.environ.get('TELEGRAM_CHAT_ID', '')
 ROUTER_URL  = os.environ.get('ROUTER_URL',  'http://localhost:4097/v1/chat/completions')
 ROUTER_MODEL= os.environ.get('ROUTER_MODEL','opencode/minimax-m2.5-free')
-VOICE       = 'et-EE-AnuNeural'   # best free Estonian neural TTS
+VOICE       = 'et-EE-KalleNeural'  # male Estonian neural TTS
+VOICE_PITCH = '-15Hz'              # lower pitch for baritone effect
+TOPIC       = _ARGS.topic          # '' = default Estonia news
+GOOGLE_AI_KEY = os.environ.get('GOOGLE_AI_KEY', '')  # Gemini for better Estonian
 
 # ─── Video params ─────────────────────────────────────────────────────────────
 FPS    = 25
@@ -61,6 +71,25 @@ def web_search(query: str, n: int = 8) -> list:
 
 
 def call_llm(user_msg: str, system: str) -> str:
+    # Use Gemini when key is available (better multilingual quality)
+    if GOOGLE_AI_KEY:
+        try:
+            r = requests.post(
+                f'https://generativelanguage.googleapis.com/v1beta/models/'
+                f'gemini-2.0-flash:generateContent?key={GOOGLE_AI_KEY}',
+                json={
+                    'systemInstruction': {'parts': [{'text': system}]},
+                    'contents': [{'parts': [{'text': user_msg}]}],
+                    'generationConfig': {'temperature': 0.7, 'maxOutputTokens': 512},
+                },
+                timeout=60,
+            )
+            r.raise_for_status()
+            return r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+        except Exception as e:
+            print(f'[gemini error] {e} — falling back to router', file=sys.stderr)
+
+    # Fallback: CLI Router
     try:
         r = requests.post(
             ROUTER_URL,
@@ -92,10 +121,16 @@ def load_font(size: int):
 
 # ─── Step 1: news ─────────────────────────────────────────────────────────────
 
-def fetch_news() -> str:
+def fetch_news(topic: str = '') -> str:
     today = time.strftime('%B %d %Y')
-    items = web_search(f'Estonia news today {today}', n=7)
-    items += web_search('Eesti uudised täna ERR Postimees', n=5)
+    if topic:
+        # Topic-driven: search for what the user asked about
+        items  = web_search(f'{topic} news {today}', n=7)
+        items += web_search(f'{topic} Eesti uudised', n=4)
+    else:
+        # Default: latest Estonia news
+        items  = web_search(f'Estonia news today {today}', n=7)
+        items += web_search('Eesti uudised täna ERR Postimees', n=5)
     seen, lines = set(), []
     for it in items:
         t = it.get('title', '').strip()
@@ -108,14 +143,15 @@ def fetch_news() -> str:
 
 # ─── Step 2: Estonian script ──────────────────────────────────────────────────
 
-def make_estonian_script(news: str) -> str:
+def make_estonian_script(news: str, topic: str = '') -> str:
     system = (
         'Sa oled Eesti teleuudiste diktor. Kirjuta loomulik, selge eestikeelne uudistekst. '
         'Ära kasuta numbreid, hashtage ega kirjavahemärke peale punkti ja koma. '
         'Ainult lihtlausetest koosnev, kõnesobilik tekst.'
     )
+    topic_line = f'Teema: {topic}.\n\n' if topic else ''
     prompt = (
-        f'Tänased Eesti uudised:\n\n{news}\n\n'
+        f'{topic_line}Uudised:\n\n{news}\n\n'
         f'Kirjuta 60-sekundiline eestikeelne uudistesaate tekst. '
         f'Maksimaalselt 120 sõna. Alusta kohe uudistega, ilma tervituseta.'
     )
@@ -124,15 +160,42 @@ def make_estonian_script(news: str) -> str:
 
 # ─── Step 3: TTS + word timestamps ───────────────────────────────────────────
 
+def align_words_to_script(script_text: str, whisper_timings: list) -> list:
+    """
+    Map original script words to whisper timestamps via proportional alignment.
+    Whisper timing is accurate; whisper text is not (transcription errors).
+    We keep timing from whisper but display the original script words.
+    """
+    orig_words = re.findall(r'\S+', script_text)
+    if not orig_words or not whisper_timings:
+        return whisper_timings
+
+    n_orig = len(orig_words)
+    n_wh   = len(whisper_timings)
+    result = []
+
+    for i, word in enumerate(orig_words):
+        # Map original word index proportionally into whisper timing range
+        wh_lo = int(i * n_wh / n_orig)
+        wh_hi = int((i + 1) * n_wh / n_orig) - 1
+        wh_hi = max(wh_lo, min(wh_hi, n_wh - 1))
+
+        start = whisper_timings[wh_lo][0]
+        end   = whisper_timings[wh_hi][1]
+        result.append((start, end, word))
+
+    return result
+
+
 async def generate_tts(text: str, audio_path: str) -> list:
     """
     Generate TTS audio, then use faster-whisper to get word-level timestamps.
-    Returns list of (start_s, end_s, word) tuples.
+    Returns list of (start_s, end_s, word) tuples using ORIGINAL script words.
     """
     import edge_tts
 
-    # Step A: Generate audio via edge-tts
-    communicate = edge_tts.Communicate(text, voice=VOICE)
+    # Step A: Generate audio via edge-tts (male voice, lowered pitch for baritone)
+    communicate = edge_tts.Communicate(text, voice=VOICE, pitch=VOICE_PITCH)
     with open(audio_path, 'wb') as af:
         async for chunk in communicate.stream():
             if chunk['type'] == 'audio':
@@ -145,7 +208,7 @@ async def generate_tts(text: str, audio_path: str) -> list:
         capture_output=True, check=True
     )
 
-    # Step C: faster-whisper with word timestamps (model already cached)
+    # Step C: faster-whisper for timing only (text from original script)
     print('     Running faster-whisper for word timestamps...')
     from faster_whisper import WhisperModel
     model = WhisperModel('small', device='cpu', compute_type='int8')
@@ -156,13 +219,16 @@ async def generate_tts(text: str, audio_path: str) -> list:
         vad_filter=True,
     )
 
-    word_timings = []
+    whisper_timings = []
     for seg in segments:
         if seg.words:
             for w in seg.words:
-                word_timings.append((w.start, w.end, w.word.strip()))
+                whisper_timings.append((w.start, w.end, w.word.strip()))
 
-    return word_timings
+    # Step D: Replace whisper words with original script words, keep timing
+    n_script = len(text.split())
+    print(f'     Aligning {n_script} script words → {len(whisper_timings)} whisper timestamps...')
+    return align_words_to_script(text, whisper_timings)
 
 
 # ─── Step 4+5: Render frames → ffmpeg ─────────────────────────────────────────
@@ -345,18 +411,20 @@ def send_video(path: str, caption: str):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def main():
-    print('=== Eesti Uudiste Videomasin ===\n')
+    topic = TOPIC  # from --topic arg or empty
+    label = f'"{topic}"' if topic else 'Estonia news'
+    print(f'=== Eesti Uudiste Videomasin — {label} ===\n')
 
     # 1. News
-    print('1/6  Fetching Estonia news...')
-    news = fetch_news()
+    print('1/6  Fetching news...')
+    news = fetch_news(topic)
     if not news:
         sys.exit('Could not fetch news.')
     print(f'     Got {news.count(chr(10)) + 1} lines.')
 
     # 2. Script
     print('2/6  Generating Estonian voiceover script...')
-    script = make_estonian_script(news)
+    script = make_estonian_script(news, topic)
     print(f'     Script ({len(script)} chars):\n     {script[:120]}...\n')
 
     # 3. TTS
@@ -378,7 +446,8 @@ async def main():
             sys.exit('Video generation failed.')
 
     # 6. Send
-    caption = f'Eesti uudised — {time.strftime("%d. %B %Y")}'
+    caption_topic = topic if topic else 'Eesti uudised'
+    caption = f'{caption_topic} — {time.strftime("%d. %B %Y")}'
     print('5/6  Sending to Telegram...')
     send_video(out, caption)
     print('\nDone.')

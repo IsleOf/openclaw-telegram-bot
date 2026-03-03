@@ -43,8 +43,10 @@ ALLOWED_CHAT_IDS = set(
     int(x) for x in os.environ.get('ALLOWED_CHAT_IDS', '').split(',') if x.strip()
 )  # empty = allow all
 
-# Path to voice_transcribe.py (same dir as this file)
-TRANSCRIBE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'voice_transcribe.py')
+# Sibling scripts
+_HERE = os.path.dirname(os.path.abspath(__file__))
+TRANSCRIBE_SCRIPT = os.path.join(_HERE, 'voice_transcribe.py')
+NEWS_VIDEO_SCRIPT = os.path.join(_HERE, 'news_video.py')
 
 # System prompt for the AI
 SYSTEM_PROMPT = """You are Claw 🦞, a direct and resourceful AI assistant. User: DaN.
@@ -86,7 +88,79 @@ def is_exec_task(text: str) -> bool:
     t = text.strip()
     return (bool(EXEC_PATTERN.match(t))
             and not t.endswith('?')
-            and not QUESTION_PATTERN.match(t))
+            and not QUESTION_PATTERN.match(t)
+            and not is_video_request(t))  # video has its own handler
+
+
+VIDEO_PATTERN = re.compile(
+    r'\b(make|create|generate|produce|render|give me|show me|send)\s+(a\s+|me\s+|us\s+)?'
+    r'(news\s+)?video\b'
+    r'|\bvideo\s+(about|on|covering|of)\b'
+    r'|\bnews\s+video\b'
+    r'|\bvideo\s+about\b',
+    re.IGNORECASE
+)
+
+def is_video_request(text: str) -> bool:
+    return bool(VIDEO_PATTERN.search(text))
+
+
+def extract_video_topic(text: str, history: list) -> str:
+    """
+    Extract what the video should be about from the message or conversation history.
+    Handles 'create video about that/it/this' by checking recent context.
+    """
+    # Explicit topic after 'about/on/covering/of'
+    m = re.search(
+        r'\b(?:video\s+)?(?:about|on|covering|of|regarding)\s+(.+?)(?:\s*$|\s*please|\s*pls)',
+        text, re.IGNORECASE
+    )
+    if m:
+        topic = m.group(1).strip()
+        # Ignore pure pronouns → fall through to history
+        if topic.lower() not in ('that', 'it', 'this', 'them', 'those'):
+            return topic
+
+    # Strip all video-command words and see if anything useful remains
+    clean = re.sub(
+        r'\b(make|create|generate|produce|render|give|show|send|me|us|a|an|the|'
+        r'news|video|clip|about|on|that|this|it|them|those|please|pls)\b',
+        ' ', text, flags=re.IGNORECASE
+    ).strip()
+    if len(clean) > 3:
+        return clean
+
+    # 'that' / 'it' → look at last substantive message in history
+    for msg in reversed(list(history)):
+        content = msg.get('content', '').strip()
+        # Skip short/empty messages and video requests themselves
+        if len(content) > 15 and not VIDEO_PATTERN.search(content):
+            # Take first 80 chars as topic hint
+            return content[:80]
+
+    return ''  # empty = default Estonia news
+
+
+def run_news_video(topic: str, chat_id: int) -> bool:
+    """Run news_video.py in subprocess, targeting a specific chat."""
+    env = os.environ.copy()
+    env['TELEGRAM_BOT_TOKEN'] = BOT_TOKEN
+    env['ROUTER_URL'] = ROUTER_URL
+    env['ROUTER_MODEL'] = ROUTER_MODEL
+    cmd = [sys.executable, NEWS_VIDEO_SCRIPT, '--chat-id', str(chat_id)]
+    if topic:
+        cmd += ['--topic', topic]
+    try:
+        result = subprocess.run(cmd, timeout=600, env=env, capture_output=True, text=True)
+        if result.returncode != 0:
+            log.error('news_video.py stderr: %s', result.stderr[-300:])
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        log.error('news_video.py timed out')
+        return False
+    except Exception as e:
+        log.error('news_video.py error: %s', e)
+        return False
 
 
 # ─── Router call ─────────────────────────────────────────────────────────────
@@ -273,6 +347,23 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     log.info('Text from chat %s: %s', chat_id, text[:80])
     HISTORY[chat_id].append({'role': 'user', 'content': text})
+
+    # ── Video request ─────────────────────────────────────────────────────────
+    if is_video_request(text):
+        topic = extract_video_topic(text, list(HISTORY[chat_id]))
+        label = f'"{topic}"' if topic else 'Estonia news'
+        status_msg = await update.message.reply_text(
+            f'🎬 Generating video about {label}...\n'
+            f'(news fetch → Estonian TTS → word-sync render → send)'
+        )
+        try:
+            ok = await asyncio.to_thread(run_news_video, topic, chat_id)
+            result_text = '🎬 Video sent!' if ok else '⚠️ Video generation failed — check logs.'
+        except Exception as e:
+            result_text = f'⚠️ Video error: {e}'
+        await status_msg.edit_text(result_text)
+        HISTORY[chat_id].append({'role': 'assistant', 'content': result_text})
+        return
 
     exec_mode = is_exec_task(text)
 

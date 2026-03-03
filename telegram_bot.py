@@ -256,25 +256,45 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Show typing indicator
     await ctx.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
 
-    response = call_router(list(HISTORY[chat_id]))
-    HISTORY[chat_id].append({'role': 'assistant', 'content': response})
-
-    for chunk in _split_message(response):
-        await update.message.reply_text(chunk)
+    try:
+        response = call_router(list(HISTORY[chat_id]))
+        HISTORY[chat_id].append({'role': 'assistant', 'content': response})
+        for chunk in _split_message(response):
+            await update.message.reply_text(chunk)
+    except Exception as e:
+        log.error('handle_text error: %s', e)
+        await update.message.reply_text(f'⚠️ Error: {e}')
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _split_message(text: str, limit: int = 4000):
-    """Split text into Telegram-safe chunks."""
+    """Split text into Telegram-safe chunks (hard limit: 4096 chars)."""
     if len(text) <= limit:
         yield text
         return
-    # Split at paragraph boundaries
+
+    # Try splitting at double-newlines (paragraphs) first
     paragraphs = text.split('\n\n')
     chunk = ''
     for para in paragraphs:
-        if len(chunk) + len(para) + 2 > limit:
+        # If a single paragraph itself exceeds limit, split it further
+        if len(para) > limit:
+            if chunk:
+                yield chunk.strip()
+                chunk = ''
+            # Split on single newlines
+            for line in para.split('\n'):
+                if len(line) > limit:
+                    # Hard split on characters as last resort
+                    for i in range(0, len(line), limit):
+                        yield line[i:i + limit]
+                elif len(chunk) + len(line) + 1 > limit:
+                    yield chunk.strip()
+                    chunk = line
+                else:
+                    chunk = chunk + '\n' + line if chunk else line
+        elif len(chunk) + len(para) + 2 > limit:
             if chunk:
                 yield chunk.strip()
             chunk = para
